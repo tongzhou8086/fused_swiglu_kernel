@@ -618,22 +618,33 @@ __device__ __forceinline__ void matmul_save_factors_impl(
     tcgen05_fence_after_thread_sync();
 
     const int lane     = tid % WARP_SIZE;
-    const int row_warp = warp_id;                   // 0..7 — 4 do TMEM work, others idle
-    const int my_row   = (row_warp & 3) * 32 + lane;
+    // 4 row-warps × 2 col-warps = all 8 warps participate in Phase 1.
+    //   row_warp ∈ {0..3} : 32-row strip of TMEM
+    //   col_warp ∈ {0..1} : left-half or right-half of EACH chunk
+    // Each warp covers 32 rows × (BN_HALF/2) cols of LEFT and the
+    // matching (BN_HALF/2) cols of GATE — two TMEM reads per LD_X iter.
+    const int row_warp = warp_id & 3;
+    const int col_warp = warp_id >> 2;
+    const int my_row   = row_warp * 32 + lane;
+    constexpr int COL_PER_WARP = BN_HALF / 2;       // 64 at BN_HALF=128
+    static_assert(COL_PER_WARP % LD_X == 0,
+                  "COL_PER_WARP must be a multiple of LD_X");
+    const int col_in_chunk = col_warp * COL_PER_WARP;
 
     const uint32_t taddr_row_base =
-        taddr + (((uint32_t)(cta_rank * BLOCK_M + (row_warp & 3) * 32)) << 16);
+        taddr + (((uint32_t)(cta_rank * BLOCK_M + row_warp * 32)) << 16);
 
-    // Phase 1: warps 0..3 read TMEM, fuse, stage to SMEM.
-    if (warp_id < 4) {
+    // Phase 1: all 8 warps read TMEM (4 row × 2 col split), fuse, stage to SMEM.
+    {
         #pragma unroll
-        for (int sub = 0; sub < BN_HALF; sub += LD_X) {
-            // Read left chunk: TMEM cols [sub, sub+LD_X).
+        for (int sub = 0; sub < COL_PER_WARP; sub += LD_X) {
+            const int n_left = col_in_chunk + sub;
+            // Read left chunk: TMEM cols [n_left, n_left+LD_X).
             float left_vals[LD_X];
-            tcgen05_ld_32x32b_x32(taddr_row_base + (uint32_t)sub, left_vals);
-            // Read gate chunk: TMEM cols [BN_HALF+sub, BN_HALF+sub+LD_X).
+            tcgen05_ld_32x32b_x32(taddr_row_base + (uint32_t)n_left, left_vals);
+            // Read gate chunk: TMEM cols [BN_HALF+n_left, BN_HALF+n_left+LD_X).
             float gate_vals[LD_X];
-            tcgen05_ld_32x32b_x32(taddr_row_base + (uint32_t)(BN_HALF + sub), gate_vals);
+            tcgen05_ld_32x32b_x32(taddr_row_base + (uint32_t)(BN_HALF + n_left), gate_vals);
             tcgen05_wait_ld();
 
             // Fuse: silu, silu', factor_gate, out — all in registers.
@@ -668,17 +679,16 @@ __device__ __forceinline__ void matmul_save_factors_impl(
             }
 
             // Stage to SMEM as int4 stores (16 bytes = 8 bf16 = 4 bf162 per iter).
-            // OUT_sh layout: [BM][BN_HALF (+ pad)]   col `sub..sub+LD_X` of out
-            // FAC_sh layout: [BM][BLOCK_N (+ pad)]   chunked:
-            //                cols [sub, sub+LD_X)            = silu       (factor_left)
-            //                cols [BN_HALF+sub, ...+LD_X)    = factor_gate
+            //   OUT_sh[my_row][n_left ..]               = out
+            //   FAC_sh[my_row][n_left ..]               = silu       (factor_left)
+            //   FAC_sh[my_row][BN_HALF + n_left ..]     = factor_gate
             #pragma unroll
             for (int j = 0; j < LD_X / 8; j++) {
-                *reinterpret_cast<int4*>(&OUT_sh[my_row][sub + j * 8]) =
+                *reinterpret_cast<int4*>(&OUT_sh[my_row][n_left + j * 8]) =
                     *reinterpret_cast<int4*>(&out_pack[j * 4]);
-                *reinterpret_cast<int4*>(&FAC_sh[my_row][sub + j * 8]) =
+                *reinterpret_cast<int4*>(&FAC_sh[my_row][n_left + j * 8]) =
                     *reinterpret_cast<int4*>(&fl_pack[j * 4]);
-                *reinterpret_cast<int4*>(&FAC_sh[my_row][BN_HALF + sub + j * 8]) =
+                *reinterpret_cast<int4*>(&FAC_sh[my_row][BN_HALF + n_left + j * 8]) =
                     *reinterpret_cast<int4*>(&fg_pack[j * 4]);
             }
         }
