@@ -20,7 +20,11 @@ W_packed = fs.pack_swiglu_weight_chunked_torch(W_normal)
 CONFIGS = []
 for (bn, bk, ns) in [(256, 64, 7), (256, 64, 6), (256, 64, 5), (256, 64, 4), (256, 128, 3)]:
     for gsm in (1, 4, 8, 16, 32):
-        CONFIGS.append((bn, bk, ns, gsm))
+        CONFIGS.append((bn, bk, ns, gsm, False))   # non-persistent
+# Persistent variants: only NS=4 and NS=7 satisfy the phase-parity constraint.
+for ns in (4, 7):
+    for gsm in (1, 4, 8, 16, 32):
+        CONFIGS.append((256, 64, ns, gsm, True))   # persistent
 
 print(f"shape: M={M}  K={K}  N={N}")
 print(f"sweep: {len(CONFIGS)} CUDA configs (rep=500ms / warmup=50ms / median)")
@@ -28,28 +32,31 @@ print()
 
 results = []
 for i, cfg in enumerate(CONFIGS, 1):
-    bn, bk, ns, gsm = cfg
+    bn, bk, ns, gsm, persistent = cfg
+    pers_tag = "PERS" if persistent else "NORM"
     try:
-        fs.cuda_matmul_save_factors(x, W_packed, config=cfg)
+        ksuffix = (bn, bk, ns, gsm)
+        fs.cuda_matmul_save_factors(x, W_packed, config=ksuffix, persistent=persistent)
         torch.cuda.synchronize()
         ms, _, _ = tt.do_bench(
-            lambda: fs.cuda_matmul_save_factors(x, W_packed, config=cfg),
+            lambda: fs.cuda_matmul_save_factors(x, W_packed, config=ksuffix, persistent=persistent),
             warmup=50, rep=500, quantiles=(0.5, 0.0, 1.0))
         tflops = FLOPS_FWD / (ms / 1e3) / 1e12
         pct = tflops * 1e12 / B200_PEAK * 100
-        print(f"  [{i:2d}/{len(CONFIGS)}] BN={bn} BK={bk:3d} NS={ns} GSM={gsm:2d}  "
+        print(f"  [{i:2d}/{len(CONFIGS)}] {pers_tag} BN={bn} BK={bk:3d} NS={ns} GSM={gsm:2d}  "
               f"{ms:7.3f} ms   {tflops:7.1f} TFLOPS   {pct:5.1f}% peak",
               flush=True)
         results.append((ms, tflops, pct, cfg))
     except Exception as e:
-        print(f"  [{i:2d}/{len(CONFIGS)}] BN={bn} BK={bk:3d} NS={ns} GSM={gsm:2d}  "
-              f"FAILED: {type(e).__name__}", flush=True)
+        print(f"  [{i:2d}/{len(CONFIGS)}] {pers_tag} BN={bn} BK={bk:3d} NS={ns} GSM={gsm:2d}  "
+              f"FAILED: {type(e).__name__}: {e}", flush=True)
 
 results.sort(key=lambda r: r[0])
 print()
 print("=== top 5 ===")
 for ms, tflops, pct, cfg in results[:5]:
-    print(f"  BN={cfg[0]} BK={cfg[1]:3d} NS={cfg[2]} GSM={cfg[3]:2d}  "
+    pers_tag = "PERS" if cfg[4] else "NORM"
+    print(f"  {pers_tag} BN={cfg[0]} BK={cfg[1]:3d} NS={cfg[2]} GSM={cfg[3]:2d}  "
           f"{ms:.3f} ms   {tflops:.1f} TFLOPS   {pct:.1f}% peak")
 
 print()

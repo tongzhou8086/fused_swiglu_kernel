@@ -350,7 +350,17 @@ __device__ __forceinline__ uint32_t make_idesc_bf16_cluster(int M, int N) {
 // `M` and `N_HALF` are the OUTPUT dims; W's column dim is 2*N_HALF.
 // `OUT_ptr` is [M, N_HALF] bf16 row-major.
 // `FAC_ptr` is [M, 2*N_HALF] bf16 row-major in chunked layout.
-template <int BLOCK_N, int BLOCK_K, int NUM_STAGES, int GROUP_SIZE_M>
+//
+// PERSISTENT mode: when NUM_SMS_PERS > 0, this kernel runs with grid =
+// NUM_SMS_PERS and each cluster walks multiple cluster-tiles.  When
+// NUM_SMS_PERS == 0, it's non-persistent (grid = #cluster_tiles).
+//
+// NS must satisfy (num_k_iters % NS == 0) AND ((num_k_iters / NS) even)
+// so each mbarrier's phase parity is preserved across tile boundaries.
+// At K=3584 BK=64, num_k_iters=56:
+//   NS=4 → 14 (even) ✓     NS=7 → 8 (even) ✓     NS=6 → mixed ✗
+template <int BLOCK_N, int BLOCK_K, int NUM_STAGES, int GROUP_SIZE_M,
+          int NUM_SMS_PERS = 0>
 __device__ __forceinline__ void matmul_save_factors_impl(
     const CUtensorMap* A_tmap,
     const CUtensorMap* B_tmap,
@@ -383,44 +393,28 @@ __device__ __forceinline__ void matmul_save_factors_impl(
     int cta_rank;
     asm volatile("mov.b32 %0, %%cluster_ctarank;" : "=r"(cta_rank));
 
-    // ── Triton-style chunked CTA swizzle at cluster-tile granularity ──
+    // ── Cluster-tile loop bounds ───────────────────────────────────────
     //
-    // Treat the grid as a 2D array of "cluster tiles" of size
-    // (2*BM, BN).  Apply Triton's GROUP_SIZE_M chunking on the
-    // cluster_id, then map back to per-CTA (bid_m, bid_n) with the
-    // cluster's two CTAs landing on adjacent M-rows of the same
-    // N-column (so cta_group::2 MMA still works).
-    //
-    // GROUP_SIZE_M is now a template parameter (b42_gsm) — swept by the
-    // Python autotuner.  b41_w8 hardcoded this to 8 (Triton's pick).
+    // The grid is a 2D array of "cluster tiles" of size (2*BM, BN).
+    // Persistent mode: grid_x = NUM_SMS_PERS, each cluster walks tiles
+    // by stepping by `cluster_stride = NUM_SMS_PERS / CTA_GROUP`.
+    // Non-persistent (NUM_SMS_PERS == 0): each cluster handles exactly
+    // one tile.
     constexpr int GROUP_M_INTRA = CTA_GROUP;   // 2 — fixed by cta_group::2
 
-    const int grid_m = M / BLOCK_M;
-    const int grid_n = N / BLOCK_N;
+    const int grid_m            = M / BLOCK_M;
+    const int grid_n            = N / BLOCK_N;
+    const int num_cluster_m     = grid_m / GROUP_M_INTRA;
+    const int num_cluster_tiles = num_cluster_m * grid_n;
 
-    const int cluster_id       = bid / GROUP_M_INTRA;
+    const int start_cluster_id = bid / GROUP_M_INTRA;
     const int which_in_cluster = bid % GROUP_M_INTRA;
-    const int num_cluster_m    = grid_m / GROUP_M_INTRA;     // M-stride 2*BM
+    const int cluster_stride   = NUM_SMS_PERS > 0
+                                 ? (NUM_SMS_PERS / GROUP_M_INTRA)
+                                 : num_cluster_tiles;   // single-iter when not persistent
 
-    // Triton's swizzle, applied to cluster_id.
-    const int num_cluster_in_group = GROUP_SIZE_M * grid_n;
-    const int group_id      = cluster_id / num_cluster_in_group;
-    const int first_clust_m = group_id * GROUP_SIZE_M;
-    // Last group may be ragged if num_cluster_m % GROUP_SIZE_M != 0;
-    // `gsm` shrinks for that case so the (cluster_id % gsm) wrap stays
-    // within the actual M-range.
-    const int gsm        = min(num_cluster_m - first_clust_m, GROUP_SIZE_M);
-    const int cluster_m  = first_clust_m + (cluster_id % gsm);
-    const int cluster_n  = (cluster_id % num_cluster_in_group) / gsm;
-
-    const int bid_m = cluster_m * GROUP_M_INTRA + which_in_cluster;
-    const int bid_n = cluster_n;
-    const int off_m  = bid_m * BLOCK_M;
-    const int off_n  = bid_n * BLOCK_N;
-    // Per-CTA N base for B loads: each CTA covers a contiguous slab of
-    // BN_LOCAL columns starting here.  Loop-invariant — hoisted out of
-    // LOAD_TILE so it isn't recomputed per K-iter.
-    const int off_n_local = off_n + cta_rank * BLOCK_N_LOCAL;
+    // Phase tracking that lives ACROSS tile iterations (we toggle per tile).
+    uint32_t all_done_phase = 0;
 
     // ── SMEM layout (per CTA) ───────────────────────────────────────────────
     //   A[NS][BK/64][BM][64]
@@ -440,7 +434,7 @@ __device__ __forceinline__ void matmul_save_factors_impl(
     __shared__ uint64_t all_mmas_done;
     __shared__ uint32_t tmem_addr_holder[1];
 
-    // ── One-time setup ──────────────────────────────────────────────────────
+    // ── One-time setup (runs once per CTA, NOT per tile) ────────────────
     if (warp_id == 0 && elect_sync()) {
         #pragma unroll
         for (int s = 0; s < NUM_STAGES; s++) {
@@ -451,14 +445,18 @@ __device__ __forceinline__ void matmul_save_factors_impl(
             mbarrier_init((uint32_t)__cvta_generic_to_shared(&mma_done_mbar[s]), 1);
         }
         mbarrier_init((uint32_t)__cvta_generic_to_shared(&all_mmas_done), 1);
-        // Pre-arrive so iter 0's wait on mma_done[NS-1] returns immediately.
-        // (Both CTAs execute this on their LOCAL mma_done[NS-1].)
+        // Pre-arrive ONCE (at init) so tile-0's TMA prologue can start
+        // without waiting for the MMA warp to catch up.  In persistent
+        // mode the phases of all mbars naturally return to a consistent
+        // state at every tile boundary because (num_k_iters / NS) is
+        // even — this is enforced by the launcher-set choice (NS=4 or 7).
         asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];"
                      :: "r"((uint32_t)__cvta_generic_to_shared(&mma_done_mbar[NUM_STAGES - 1]))
                      : "memory");
         asm volatile("fence.mbarrier_init.release.cluster;");
     } else if (warp_id == 1) {
         // cta_group::2 alloc — issued cooperatively by both CTAs' warp 1.
+        // Allocated ONCE; reused across all tile iterations.
         tcgen05_alloc_g2((uint32_t)__cvta_generic_to_shared(tmem_addr_holder),
                          BLOCK_N);
     }
@@ -471,6 +469,32 @@ __device__ __forceinline__ void matmul_save_factors_impl(
 
     // idesc: MMA covers (BM*CTA_GROUP, BN) per issue.
     const uint32_t idesc = make_idesc_bf16_cluster(BLOCK_M * CTA_GROUP, BLOCK_N);
+
+    // ── Outer tile loop (persistent or single-iter) ─────────────────────
+    for (int cluster_id = start_cluster_id;
+         cluster_id < num_cluster_tiles;
+         cluster_id += cluster_stride) {
+
+    // Triton's swizzle, applied to cluster_id.
+    const int num_cluster_in_group = GROUP_SIZE_M * grid_n;
+    const int group_id      = cluster_id / num_cluster_in_group;
+    const int first_clust_m = group_id * GROUP_SIZE_M;
+    const int gsm        = min(num_cluster_m - first_clust_m, GROUP_SIZE_M);
+    const int cluster_m  = first_clust_m + (cluster_id % gsm);
+    const int cluster_n  = (cluster_id % num_cluster_in_group) / gsm;
+
+    const int bid_m = cluster_m * GROUP_M_INTRA + which_in_cluster;
+    const int bid_n = cluster_n;
+    const int off_m  = bid_m * BLOCK_M;
+    const int off_n  = bid_n * BLOCK_N;
+    const int off_n_local = off_n + cta_rank * BLOCK_N_LOCAL;
+
+    // NOTE: NO per-tile pre-arrive.  The init pre-arrive on
+    // mma_done[NS-1] sets the cycle going for tile 0; subsequent tiles
+    // continue with the same phase pattern because each mbar's arrive
+    // count per K-loop is num_k_iters/NS which is EVEN at our supported
+    // shapes (so each mbar's phase parity is preserved across tiles).
+
 
     // ── LOAD_TILE ───────────────────────────────────────────────────────────
     //
@@ -579,10 +603,10 @@ __device__ __forceinline__ void matmul_save_factors_impl(
             cta_mask);
     }
 
-#undef LOAD_TILE
-
     // All warps on both CTAs wait for the cluster's main loop to drain.
-    mbarrier_wait((uint32_t)__cvta_generic_to_shared(&all_mmas_done), 0);
+    // Phase tracked across tile iterations (XOR-toggled at end of each iter).
+    mbarrier_wait((uint32_t)__cvta_generic_to_shared(&all_mmas_done), all_done_phase);
+    all_done_phase ^= 1;
 
     // ── Epilogue: TMEM → registers → SMEM → coalesced GMEM ───────────
     //
@@ -695,9 +719,7 @@ __device__ __forceinline__ void matmul_save_factors_impl(
     }
 
     __syncthreads();
-    if (warp_id == 0 && elect_sync()) {
-        tcgen05_dealloc_g2(taddr, BLOCK_N);
-    }
+    // NOTE: TMEM dealloc moves OUTSIDE the tile loop (see after loop end).
 
     // Phase 2: SMEM → GMEM, coalesced.  Two stores: OUT and FAC.
     constexpr int CHUNK_BF16 = 8;       // 16 bytes per int4
@@ -740,6 +762,20 @@ __device__ __forceinline__ void matmul_save_factors_impl(
                 *reinterpret_cast<const int4*>(&FAC_sh[row][col]);
         }
     }
+
+    // End-of-tile sync: ensures all threads have finished their int4
+    // stores (read from SMEM into the store buffer) before any thread
+    // overwrites SMEM in the next tile's Phase 1.
+    __syncthreads();
+
+    }  // end outer tile loop
+
+#undef LOAD_TILE
+
+    // ── Cleanup (runs once per CTA, AFTER all tiles processed) ─────────
+    if (warp_id == 0 && elect_sync()) {
+        tcgen05_dealloc_g2(taddr, BLOCK_N);
+    }
 }
 
 
@@ -754,7 +790,23 @@ void matmul_save_factors_bm128_bn##BN_##_bk##BK_##_ns##NS_##_gsm##GSM_(         
     __nv_bfloat16* OUT_ptr, __nv_bfloat16* FAC_ptr,                                    \
     int M, int N_HALF, int K)                                                          \
 {                                                                                       \
-    matmul_save_factors_impl<BN_, BK_, NS_, GSM_>(                                     \
+    matmul_save_factors_impl<BN_, BK_, NS_, GSM_, /*NUM_SMS_PERS=*/0>(                \
+        &A_tmap, &B_tmap, OUT_ptr, FAC_ptr, M, N_HALF, K);                             \
+}
+
+// Persistent variant: NUM_SMS_PERS=148 (B200 SM count).  NS must satisfy
+// (num_k_iters / NS) is even at every supported K — currently only NS=4
+// at K=3584 BK=64 (and NS=7).
+#define MAKE_LAUNCHER_PERS(BN_, BK_, NS_, GSM_)                                       \
+extern "C" __global__ __cluster_dims__(CTA_GROUP, 1, 1)                                \
+__launch_bounds__(256, LB_MIN_BLOCKS)                                                  \
+void matmul_save_factors_pers_bm128_bn##BN_##_bk##BK_##_ns##NS_##_gsm##GSM_(          \
+    const __grid_constant__ CUtensorMap A_tmap,                                        \
+    const __grid_constant__ CUtensorMap B_tmap,                                        \
+    __nv_bfloat16* OUT_ptr, __nv_bfloat16* FAC_ptr,                                    \
+    int M, int N_HALF, int K)                                                          \
+{                                                                                       \
+    matmul_save_factors_impl<BN_, BK_, NS_, GSM_, /*NUM_SMS_PERS=*/148>(              \
         &A_tmap, &B_tmap, OUT_ptr, FAC_ptr, M, N_HALF, K);                             \
 }
 
@@ -774,5 +826,19 @@ MAKE_GSM_SET(256, 64, 5)
 MAKE_GSM_SET(256, 64, 4)
 MAKE_GSM_SET(256, 128, 3)
 
+// Persistent launchers — only NS=4 and NS=7 satisfy the per-tile
+// phase-parity constraint at K=3584 BK=64 (56 K-iters; 56/NS must be even).
+#define MAKE_GSM_SET_PERS(BN_, BK_, NS_)  \
+    MAKE_LAUNCHER_PERS(BN_, BK_, NS_, 1)  \
+    MAKE_LAUNCHER_PERS(BN_, BK_, NS_, 4)  \
+    MAKE_LAUNCHER_PERS(BN_, BK_, NS_, 8)  \
+    MAKE_LAUNCHER_PERS(BN_, BK_, NS_, 16) \
+    MAKE_LAUNCHER_PERS(BN_, BK_, NS_, 32)
+
+MAKE_GSM_SET_PERS(256, 64, 4)
+MAKE_GSM_SET_PERS(256, 64, 7)
+
+#undef MAKE_GSM_SET_PERS
 #undef MAKE_GSM_SET
+#undef MAKE_LAUNCHER_PERS
 #undef MAKE_LAUNCHER

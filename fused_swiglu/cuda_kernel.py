@@ -21,6 +21,7 @@ _CUBIN   = os.path.join(_HERE, f"_matmul_save_factors_{SM_ARCH}.cubin")
 BM = 128
 NW = 8
 CTA_GROUP = 2
+NUM_SMS = 148   # B200
 
 # Match the (BN, BK, NS, GSM) launchers emitted in the .cu file.
 _DEFAULT_CONFIG = (256, 64, 6, 32)        # mirrors b42's tuned production config
@@ -30,8 +31,9 @@ def _get_mod():
     return get_module_jit(_CU_PATH, _CUBIN, ["-arch=sm_100a", "-DLB_MIN_BLOCKS=1"])
 
 
-def _kname(bn, bk, ns, gsm):
-    return f"matmul_save_factors_bm{BM}_bn{bn}_bk{bk}_ns{ns}_gsm{gsm}"
+def _kname(bn, bk, ns, gsm, persistent: bool = False):
+    pers = "_pers" if persistent else ""
+    return f"matmul_save_factors{pers}_bm{BM}_bn{bn}_bk{bk}_ns{ns}_gsm{gsm}"
 
 
 def _smem_bytes(bn, bk, ns):
@@ -86,21 +88,24 @@ def _maybe_pad_A(A, M_pad):
     return A_pad
 
 
-def matmul_save_factors(A, W_packed, config=_DEFAULT_CONFIG):
+def matmul_save_factors(A, W_packed, config=_DEFAULT_CONFIG, persistent: bool = False):
     """Computes `out = left * silu(gate)` and `factors = [silu | left·silu']`.
 
-    A         : [M, K]      bf16 row-major
-    W_packed  : [K, 2*N]    bf16 row-major, chunk-interleaved
-    config    : (BN, BK, NS, GSM) — must match a launcher in the .cu file
+    A          : [M, K]      bf16 row-major
+    W_packed   : [K, 2*N]    bf16 row-major, chunk-interleaved
+    config     : (BN, BK, NS, GSM) — must match a launcher in the .cu file
+    persistent : if True, use the persistent-grid variant (grid = NUM_SMS).
+                 Only NS=4 and NS=7 have persistent launchers compiled.
 
     Returns:
       out      : [M, N]     bf16 row-major
       factors  : [M, 2*N]   bf16 row-major, chunked layout matching W_packed
 
     NOTE: this kernel uses cta_group::2 cluster MMA, which requires the
-    M-tile count to be even.  At M=11136, M/BM=87 is odd, so we pad M
-    to the next 2*BM multiple (11264) and slice the output back.  Costs
-    ~1.1 % extra compute at this shape.
+    M-tile count to be even (and the persistent variant requires the
+    cluster-tile count to be well-defined).  At M=11136, M/BM=87 is odd,
+    so we pad M to the next 2*BM multiple (11264) and slice the output
+    back.  Costs ~1.1 % extra compute at this shape.
     """
     bn, bk, ns, gsm = config
     M, K = A.shape
@@ -109,7 +114,8 @@ def matmul_save_factors(A, W_packed, config=_DEFAULT_CONFIG):
     N = twoN // 2
     assert twoN % bn == 0
     assert K % bk == 0
-    assert (twoN // bn) % CTA_GROUP == 0 or True  # cluster pairing handled along M
+    if persistent:
+        assert ns in (4, 7), f"persistent variant only compiled for NS=4,7 (got NS={ns})"
 
     M_pad = _pad_M(M)
     assert M_pad % BM == 0 and (M_pad // BM) % 2 == 0, f"M_pad={M_pad}"
@@ -121,13 +127,16 @@ def matmul_save_factors(A, W_packed, config=_DEFAULT_CONFIG):
 
     A_tmap, B_tmap = _setup(A_use, W_packed, bn, bk)
     mod = _get_mod()
-    fn  = mod.get_function(_kname(bn, bk, ns, gsm))
+    fn  = mod.get_function(_kname(bn, bk, ns, gsm, persistent=persistent))
 
     smem = _smem_bytes(bn, bk, ns)
     if smem > 0:
         fn.set_attribute(drv.function_attribute.MAX_DYNAMIC_SHARED_SIZE_BYTES, smem)
 
-    grid_x = (M_pad // BM) * (twoN // bn)
+    if persistent:
+        grid_x = NUM_SMS                                                      # 148 on B200
+    else:
+        grid_x = (M_pad // BM) * (twoN // bn)                                 # one CTA per tile
     grid  = (grid_x, 1, 1)
     block = (NW * 32, 1, 1)
     fn(A_tmap, B_tmap,
