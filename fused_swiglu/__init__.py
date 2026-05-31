@@ -21,3 +21,10 @@ from .triton_baseline import (
     SAVE_NUM_STAGES,
     WARP_SPECIALIZE,
 )
+
+# CUDA implementation (b42-based).  Compiled on first use.
+try:
+    from .cuda_kernel import matmul_save_factors as cuda_matmul_save_factors
+    HAS_CUDA_KERNEL = True
+except Exception as _e:
+    HAS_CUDA_KERNEL = False

@@ -140,6 +140,14 @@ def main():
     bench(lambda: fs.fused_swiglu_wide_packed_save_factors(x, W_packed),
           "Triton save_factors (GEMM + activation + factor save) ← target")
 
+    # Our b42-based CUDA kernel doing the same work.
+    if fs.HAS_CUDA_KERNEL:
+        # Warm + JIT-compile if not yet cached.
+        fs.cuda_matmul_save_factors(x, W_packed)
+        torch.cuda.synchronize()
+        bench(lambda: fs.cuda_matmul_save_factors(x, W_packed),
+              "CUDA save_factors (b42-based, our version)")
+
     # cuBLAS + compile, no factor save (cheapest baseline that doesn't save).
     @torch.compile
     def compiled_act(preact):
