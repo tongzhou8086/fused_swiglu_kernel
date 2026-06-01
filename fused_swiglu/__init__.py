@@ -28,3 +28,10 @@ try:
     HAS_CUDA_KERNEL = True
 except Exception as _e:
     HAS_CUDA_KERNEL = False
+
+# x64-load variant (wider tcgen05.ld).
+try:
+    from .cuda_kernel_x64 import matmul_save_factors_x64 as cuda_matmul_save_factors_x64
+    HAS_CUDA_KERNEL_X64 = True
+except Exception as _e:
+    HAS_CUDA_KERNEL_X64 = False
