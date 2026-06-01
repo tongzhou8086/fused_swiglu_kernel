@@ -221,34 +221,6 @@ __device__ __forceinline__ void tma_2d_load(
         :: "r"(smem_dst), "l"(tmap), "r"(x), "r"(y), "r"(mbar) : "memory");
 }
 
-// ── TMA 2D store (SMEM → GMEM, async/bulk_group) ────────────────────────────
-//
-// `bulk_group` makes the store async — it fires a hardware-managed copy
-// from SMEM through the TMA engine to GMEM.  The issuing thread doesn't
-// stall waiting for the copy; subsequent instructions (including the
-// NEXT tile's K-loop) run while the TMA engine drains the previous
-// tile's outputs in the background.  Completion is tracked via
-// commit_group + wait_group.read.
-__device__ __forceinline__ void tma_2d_store(
-    const void* tmap, uint32_t smem_src, int x, int y
-) {
-    asm volatile(
-        "cp.async.bulk.tensor.2d.global.shared::cta.bulk_group "
-        "[%0, {%1, %2}], [%3];"
-        :: "l"(tmap), "r"(x), "r"(y), "r"(smem_src) : "memory");
-}
-
-__device__ __forceinline__ void tma_commit_group() {
-    asm volatile("cp.async.bulk.commit_group;" ::: "memory");
-}
-
-// Wait for all but the most-recent `N` commit_groups to complete.
-// Pass 0 to wait for ALL outstanding async stores.
-template <int N>
-__device__ __forceinline__ void tma_wait_group() {
-    asm volatile("cp.async.bulk.wait_group.read %0;" :: "n"(N) : "memory");
-}
-
 // ── tcgen05 PTX wrappers (cta_group::2) ─────────────────────────────────────
 
 __device__ __forceinline__ void tcgen05_alloc_g2(uint32_t smem_dst, uint32_t n_cols) {
@@ -392,8 +364,8 @@ template <int BLOCK_N, int BLOCK_K, int NUM_STAGES, int GROUP_SIZE_M,
 __device__ __forceinline__ void matmul_save_factors_impl(
     const CUtensorMap* A_tmap,
     const CUtensorMap* B_tmap,
-    const CUtensorMap* OUT_tmap,    // TMA store descriptor for OUT [M, N_HALF]
-    const CUtensorMap* FAC_tmap,    // TMA store descriptor for FAC [M, 2*N_HALF]
+    __nv_bfloat16* OUT_ptr,
+    __nv_bfloat16* FAC_ptr,
     int M, int N_HALF, int K
 ) {
     constexpr int BLOCK_M       = 128;
@@ -657,18 +629,15 @@ __device__ __forceinline__ void matmul_save_factors_impl(
     // OUT and FAC.  Output widths are N_HALF for OUT and 2*N_HALF for
     // FAC; per-CTA writes are BM rows × {BN_HALF, BN_HALF·2} cols.
 
-    // SMEM staging for TMA stores.  Laid out AFTER the K-loop ring so
-    // pending async TMA stores don't conflict with the NEXT tile's TMA
-    // loads (which overwrite ring SMEM).  This lets us use wait_group<1>
-    // instead of wait_group<0> — only the OLDEST commit_group has to
-    // drain before we issue a new one, the most recent stays in flight.
-    constexpr int OUT_COLS = BN_HALF;                 // 128 at BN=256
-    constexpr int FAC_COLS = BLOCK_N;                 // 256 at BN=256
-    constexpr int RING_BYTES = NUM_STAGES * (A_SLOT_BYTES + B_SLOT_BYTES);
-    constexpr int SMEM_OUT_BYTES = BLOCK_M * OUT_COLS * sizeof(__nv_bfloat16);
+    constexpr int OUT_PAD       = BN_HALF + 8;          // row stride in SMEM_out, bf16
+    constexpr int FAC_PAD       = BLOCK_N + 8;          // row stride in SMEM_fac, bf16
+    constexpr int SMEM_OUT_BYTES = BLOCK_M * OUT_PAD * sizeof(__nv_bfloat16);
 
-    auto OUT_sh = reinterpret_cast<__nv_bfloat16 (*)[OUT_COLS]>(smem + RING_BYTES);
-    auto FAC_sh = reinterpret_cast<__nv_bfloat16 (*)[FAC_COLS]>(smem + RING_BYTES + SMEM_OUT_BYTES);
+    // SMEM layout (aliasing on top of the now-dead K-loop ring):
+    //   smem[0 ..                    ): SMEM_out[BM][OUT_PAD]
+    //   smem[SMEM_OUT_BYTES .. ..    ): SMEM_fac[BM][FAC_PAD]
+    auto OUT_sh = reinterpret_cast<__nv_bfloat16 (*)[OUT_PAD]>(smem);
+    auto FAC_sh = reinterpret_cast<__nv_bfloat16 (*)[FAC_PAD]>(smem + SMEM_OUT_BYTES);
 
     tcgen05_fence_after_thread_sync();
 
@@ -750,58 +719,58 @@ __device__ __forceinline__ void matmul_save_factors_impl(
     }
 
     __syncthreads();
-    // ── Cross-proxy fence ─────────────────────────────────────────────
-    // Phase 1 writes SMEM via REGULAR stores (st.shared via int4 → bf16).
-    // The TMA store engine reads SMEM via the ASYNC proxy.  Without an
-    // explicit proxy fence, the async-proxy read may observe stale or
-    // partially-written SMEM bytes — visible as nondeterministic errors.
-    asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
-
     // NOTE: TMEM dealloc moves OUTSIDE the tile loop (see after loop end).
 
-    // Phase 2: SMEM → GMEM, ASYNC TMA stores.
-    //
-    // Two TMA stores per cluster-tile (issued by warp 0 single-lane):
-    //   - OUT: copies SMEM[OUT_sh] → GMEM[off_m..off_m+BM, out_n_base..out_n_base+BN_HALF)
-    //          via OUT_tmap descriptor (box = (BN_HALF, BM))
-    //   - FAC: copies SMEM[FAC_sh] → GMEM[off_m..off_m+BM, off_n..off_n+BLOCK_N)
-    //          via FAC_tmap descriptor (box = (BLOCK_N, BM))
-    //
-    // The stores are fire-and-forget — they enqueue work into the TMA
-    // engine's hardware queue.  We commit them into a single group,
-    // then continue immediately to the NEXT tile's K-loop.  The TMA
-    // engine drains in the background while the tensor cores run the
-    // next MMA pipeline.  A single `wait_group.read 0` at the very
-    // end of the kernel (outside the tile loop) ensures drain before
-    // kernel exit.
-    if (warp_id == 0 && elect_sync()) {
+    // Phase 2: SMEM → GMEM, coalesced.  Two stores: OUT and FAC.
+    constexpr int CHUNK_BF16 = 8;       // 16 bytes per int4
+    constexpr int TB_SIZE    = NUM_WARPS * WARP_SIZE;
+
+    // OUT [BM × BN_HALF] → GMEM [M, N_HALF].  Per-CTA col base = bid_n * BN_HALF.
+    {
+        constexpr int N_CHUNKS_OUT       = BN_HALF / CHUNK_BF16;
+        constexpr int STORES_PER_THREAD  = (BLOCK_M * BN_HALF) / (TB_SIZE * CHUNK_BF16);
+        static_assert(STORES_PER_THREAD * TB_SIZE * CHUNK_BF16 == BLOCK_M * BN_HALF,
+                      "BM*BN_HALF must be a multiple of TB_SIZE*8");
         const int out_n_base = bid_n * BN_HALF;
-        tma_2d_store(OUT_tmap,
-                     (uint32_t)__cvta_generic_to_shared(&OUT_sh[0][0]),
-                     out_n_base, off_m);
-        tma_2d_store(FAC_tmap,
-                     (uint32_t)__cvta_generic_to_shared(&FAC_sh[0][0]),
-                     off_n, off_m);
-        tma_commit_group();
+        #pragma unroll
+        for (int s = 0; s < STORES_PER_THREAD; s++) {
+            const int flat = tid + s * TB_SIZE;
+            const int row  = flat / N_CHUNKS_OUT;
+            const int col  = (flat % N_CHUNKS_OUT) * CHUNK_BF16;
+            const int gr   = off_m + row;
+            const int gc   = out_n_base + col;
+            *reinterpret_cast<int4*>(&OUT_ptr[(size_t)gr * N_HALF + gc]) =
+                *reinterpret_cast<const int4*>(&OUT_sh[row][col]);
+        }
     }
-    // End-of-tile sync.  OUT_sh / FAC_sh live AFTER the ring (non-
-    // overlapping), but the NEXT tile's Phase 1 overwrites the SAME
-    // OUT_sh / FAC_sh bytes — so we must drain the current tile's
-    // TMA store reads before that.  wait_group.read 0 = wait for ALL
-    // outstanding bulk_group reads.  In principle wait_group<1> would
-    // allow one in-flight via double-buffering, but our SMEM budget
-    // doesn't fit a doubled staging buffer.
-    tma_wait_group<0>();
+
+    // FAC [BM × BLOCK_N (chunked)] → GMEM [M, 2*N_HALF].
+    // Per-CTA col base = bid_n * BLOCK_N = off_n (chunked output of width BLOCK_N).
+    {
+        constexpr int N_CHUNKS_FAC       = BLOCK_N / CHUNK_BF16;
+        constexpr int STORES_PER_THREAD  = (BLOCK_M * BLOCK_N) / (TB_SIZE * CHUNK_BF16);
+        static_assert(STORES_PER_THREAD * TB_SIZE * CHUNK_BF16 == BLOCK_M * BLOCK_N,
+                      "BM*BLOCK_N must be a multiple of TB_SIZE*8");
+        #pragma unroll
+        for (int s = 0; s < STORES_PER_THREAD; s++) {
+            const int flat = tid + s * TB_SIZE;
+            const int row  = flat / N_CHUNKS_FAC;
+            const int col  = (flat % N_CHUNKS_FAC) * CHUNK_BF16;
+            const int gr   = off_m + row;
+            const int gc   = off_n + col;
+            *reinterpret_cast<int4*>(&FAC_ptr[(size_t)gr * N + gc]) =
+                *reinterpret_cast<const int4*>(&FAC_sh[row][col]);
+        }
+    }
+
+    // End-of-tile sync: ensures all threads have finished their int4
+    // stores (read from SMEM into the store buffer) before any thread
+    // overwrites SMEM in the next tile's Phase 1.
     __syncthreads();
 
     }  // end outer tile loop
 
 #undef LOAD_TILE
-
-    // Drain ALL outstanding TMA stores (each tile committed one group).
-    // After this point it's safe to assume every byte of OUT/FAC has
-    // hit GMEM, and the host's cudaStreamSynchronize will see the writes.
-    tma_wait_group<0>();
 
     // ── Cleanup (runs once per CTA, AFTER all tiles processed) ─────────
     if (warp_id == 0 && elect_sync()) {
@@ -818,12 +787,11 @@ __launch_bounds__(256, LB_MIN_BLOCKS)                                           
 void matmul_save_factors_bm128_bn##BN_##_bk##BK_##_ns##NS_##_gsm##GSM_(               \
     const __grid_constant__ CUtensorMap A_tmap,                                        \
     const __grid_constant__ CUtensorMap B_tmap,                                        \
-    const __grid_constant__ CUtensorMap OUT_tmap,                                      \
-    const __grid_constant__ CUtensorMap FAC_tmap,                                      \
+    __nv_bfloat16* OUT_ptr, __nv_bfloat16* FAC_ptr,                                    \
     int M, int N_HALF, int K)                                                          \
 {                                                                                       \
     matmul_save_factors_impl<BN_, BK_, NS_, GSM_, /*NUM_SMS_PERS=*/0>(                \
-        &A_tmap, &B_tmap, &OUT_tmap, &FAC_tmap, M, N_HALF, K);                         \
+        &A_tmap, &B_tmap, OUT_ptr, FAC_ptr, M, N_HALF, K);                             \
 }
 
 // Persistent variant: NUM_SMS_PERS=148 (B200 SM count).  NS must satisfy
@@ -835,12 +803,11 @@ __launch_bounds__(256, LB_MIN_BLOCKS)                                           
 void matmul_save_factors_pers_bm128_bn##BN_##_bk##BK_##_ns##NS_##_gsm##GSM_(          \
     const __grid_constant__ CUtensorMap A_tmap,                                        \
     const __grid_constant__ CUtensorMap B_tmap,                                        \
-    const __grid_constant__ CUtensorMap OUT_tmap,                                      \
-    const __grid_constant__ CUtensorMap FAC_tmap,                                      \
+    __nv_bfloat16* OUT_ptr, __nv_bfloat16* FAC_ptr,                                    \
     int M, int N_HALF, int K)                                                          \
 {                                                                                       \
     matmul_save_factors_impl<BN_, BK_, NS_, GSM_, /*NUM_SMS_PERS=*/148>(              \
-        &A_tmap, &B_tmap, &OUT_tmap, &FAC_tmap, M, N_HALF, K);                         \
+        &A_tmap, &B_tmap, OUT_ptr, FAC_ptr, M, N_HALF, K);                             \
 }
 
 // BN must be divisible by CTA_GROUP=2.  Sweep GROUP_SIZE_M ∈ {1,4,8,16,32}
