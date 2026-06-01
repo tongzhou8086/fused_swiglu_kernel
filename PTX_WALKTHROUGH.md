@@ -60,6 +60,99 @@ tile T+1 runs concurrently with the entire store chain.
 
 ---
 
+## Diagrams
+
+### Warp-pool architecture
+
+How a single PTX entry point becomes 3 concurrent worker roles via the
+`warp_id` split + role tag dispatch:
+
+```mermaid
+flowchart TB
+    entry["CTA launch<br/>num_warps = 12 (8 + 4 extra)"]
+    entry --> split{"%tid.x &gt;&gt; 5<br/>warp_id &lt; 8?"}
+
+    split -->|yes| poolA["<b>Pool A — DEFAULT</b><br/>warps 0..7<br/>regs = 240<br/>path: BB0_18 → BB0_20"]
+    split -->|no|  poolB["<b>Pool B — SPECIALIZED</b><br/>warps 8..11<br/>regs = 24<br/>path: BB0_1 → BB0_2"]
+
+    poolB --> dispatch{"ld.shared.b8 [smem + warp_id]<br/>brx.idx"}
+    dispatch -->|"role 0"| mma["<b>★ MMA warp</b> (warp 8)<br/>BB0_7<br/>4× tcgen05.mma per K-iter"]
+    dispatch -->|"role 1"| load["<b>★ TMA-LOAD warp</b> (warps 9-10)<br/>BB0_13<br/>3× cp.async.bulk per K-iter<br/>(X, W_lo, W_hi)"]
+    dispatch -->|"role 2"| idle["idle pad (warp 11)<br/>BB0_17"]
+    dispatch -->|"role 3"| exit["exit<br/>BB0_28"]
+
+    poolA --- jobA["<b>Job:</b> tcgen05.ld TMEM → regs<br/>SwiGLU math<br/>3× cp.async.bulk.tensor (TMA STORES)<br/>private sync: bar.sync 0, 256"]
+
+    %% mbarrier wires
+    load  -. "FULL mbar (load done)"  .-> mma
+    mma   -. "EMPTY mbar (buf reuse)" .-> load
+    mma   -. "ACC_READY mbar"         .-> poolA
+    poolA -. "TMEM_FREE mbar"         .-> mma
+
+    classDef pool fill:#e8f4ff,stroke:#3b6db5,stroke-width:2px,color:#000
+    classDef role fill:#fff4e6,stroke:#d18b1f,stroke-width:2px,color:#000
+    classDef misc fill:#f0f0f0,stroke:#888,color:#000
+    class poolA,poolB pool
+    class mma,load role
+    class idle,exit,jobA misc
+```
+
+The dotted arrows are the four SMEM mbarriers that synchronize the
+pools. Nothing else crosses pool boundaries — no shared `bar.sync` IDs,
+no shared registers, no shared CTA-wide barriers.
+
+### Pipeline timeline (3 tiles in flight)
+
+Steady-state wall-clock view. Each row is a warp group; horizontal
+extent is wall-clock time. Mermaid renders this as a Gantt chart so
+overlap is unmissable.
+
+```mermaid
+gantt
+    title Steady-state pipeline — 3 tiles concurrently in flight
+    dateFormat  X
+    axisFormat  %L
+
+    section TMA-load warp (Pool B r1)
+    K-loop tile T+1 (load X, W_lo, W_hi)  :done,   l1, 0,  60
+    K-loop tile T+2                       :active, l2, 55, 115
+    K-loop tile T+3                       :        l3, 110, 170
+
+    section MMA warp (Pool B r0)
+    K-loop tile T+1 (56× tcgen05.mma)     :done,   m1, 5,  65
+    K-loop tile T+2                       :active, m2, 60, 120
+    K-loop tile T+3                       :        m3, 115, 175
+
+    section Compute warps (Pool A — epilogue + TMA stores)
+    drain T (tcgen05.ld)                  :crit, dT, 10, 18
+    SwiGLU T                              :      sT, 18, 22
+    TMA store#1 factors_lo T              :crit, s1T, 22, 32
+    wait SMEM drain                       :      w1T, 32, 36
+    TMA store#2 factors_hi T              :crit, s2T, 36, 46
+    wait SMEM drain                       :      w2T, 46, 50
+    TMA store#3 out T                     :crit, s3T, 50, 60
+    drain T+1                             :crit, dT1, 65, 73
+    SwiGLU T+1                            :      sT1, 73, 77
+    TMA store#1 T+1                       :crit, s1T1, 77, 87
+    wait                                  :      w1T1, 87, 91
+    TMA store#2 T+1                       :crit, s2T1, 91, 101
+    wait                                  :      w2T1, 101, 105
+    TMA store#3 T+1                       :crit, s3T1, 105, 115
+```
+
+What the chart shows:
+
+- At the moment the compute warps are running **store #2 of tile T** (~ms
+  40), the MMA warp is **mid-K-loop on T+1** and the TMA-load warp is
+  **already pulling T+2 from HBM** — three tiles, three concurrent stages.
+- The epilogue drain (`drain T+1`) is gated only by `ACC_READY` from the
+  MMA warp's tile T+1 completion (~ms 65) — NOT by tile T's store #3
+  having committed to HBM.
+- Tile T's store #3 stays inflight (off-critical-path) while the next
+  tile's drain begins.
+
+---
+
 ## Loop structure (the part that's easy to lose in the PTX)
 
 Each of the three roles runs its OWN loop nest. The three nests are NOT
