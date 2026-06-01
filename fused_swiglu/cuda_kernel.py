@@ -37,25 +37,44 @@ def _kname(bn, bk, ns, gsm, persistent: bool = False):
 
 
 def _smem_bytes(bn, bk, ns):
-    """Dynamic SMEM size for the K-loop ring (epilogue aliases on top)."""
+    """Total dynamic SMEM:
+      ring     : NS * (BM + BN/CTA_GROUP) * BK * 2          (K-loop multi-stage)
+      OUT_sh   : BM * (BN/2) * 2                             (TMA-store staging)
+      FAC_sh   : BM * BN * 2                                 (TMA-store staging)
+    OUT_sh and FAC_sh live AFTER the ring (non-overlapping) so the next
+    tile's TMA loads don't conflict with the previous tile's in-flight
+    TMA stores.
+    """
     bn_local = bn // CTA_GROUP
-    return ns * (BM + bn_local) * bk * 2
+    ring  = ns * (BM + bn_local) * bk * 2
+    out_b = BM * (bn // 2) * 2
+    fac_b = BM * bn * 2
+    return ring + out_b + fac_b
 
 
 _tmap_cache: dict = {}
 
 
-def _setup(A, W_packed, bn, bk):
-    key = (A.data_ptr(), W_packed.data_ptr(), bn, bk)
+def _setup(A, W_packed, OUT, FAC, bn, bk):
+    """Build TMA descriptors for A (load), W_packed (load), OUT (store), FAC (store)."""
+    key = (A.data_ptr(), W_packed.data_ptr(),
+           OUT.data_ptr(), FAC.data_ptr(), bn, bk)
     hit = _tmap_cache.get(key)
     if hit is not None:
         return hit
-    M, K = A.shape
+    M_pad, K = A.shape
     _, twoN = W_packed.shape
-    A_tmap = tma.build_tma_2d(A.data_ptr(),        M,    K,    BM, 64, tma.SWIZZLE_128B)
-    B_tmap = tma.build_tma_2d(W_packed.data_ptr(), K,    twoN, bk, 64, tma.SWIZZLE_128B)
-    _tmap_cache[key] = (A_tmap, B_tmap)
-    return A_tmap, B_tmap
+    N_HALF = twoN // 2
+    A_tmap = tma.build_tma_2d(A.data_ptr(),        M_pad, K,     BM,   64, tma.SWIZZLE_128B)
+    B_tmap = tma.build_tma_2d(W_packed.data_ptr(), K,     twoN,  bk,   64, tma.SWIZZLE_128B)
+    # OUT/FAC TMA descriptors for STORES.  Box matches per-CTA store:
+    #   OUT: (height=BM, width=BN_HALF=bn/2)
+    #   FAC: (height=BM, width=BLOCK_N=bn) — chunked layout
+    # SWIZZLE_NONE so the SMEM source is naturally row-major contiguous.
+    OUT_tmap = tma.build_tma_2d(OUT.data_ptr(), M_pad, N_HALF, BM, bn // 2, tma.SWIZZLE_NONE)
+    FAC_tmap = tma.build_tma_2d(FAC.data_ptr(), M_pad, twoN,   BM, bn,      tma.SWIZZLE_NONE)
+    _tmap_cache[key] = (A_tmap, B_tmap, OUT_tmap, FAC_tmap)
+    return A_tmap, B_tmap, OUT_tmap, FAC_tmap
 
 
 def _pad_M(M: int) -> int:
@@ -125,7 +144,8 @@ def matmul_save_factors(A, W_packed, config=_DEFAULT_CONFIG, persistent: bool = 
     out_pad = torch.empty(M_pad, N,    device="cuda", dtype=DTYPE)
     fac_pad = torch.empty(M_pad, twoN, device="cuda", dtype=DTYPE)
 
-    A_tmap, B_tmap = _setup(A_use, W_packed, bn, bk)
+    A_tmap, B_tmap, OUT_tmap, FAC_tmap = _setup(
+        A_use, W_packed, out_pad, fac_pad, bn, bk)
     mod = _get_mod()
     fn  = mod.get_function(_kname(bn, bk, ns, gsm, persistent=persistent))
 
@@ -139,8 +159,7 @@ def matmul_save_factors(A, W_packed, config=_DEFAULT_CONFIG, persistent: bool = 
         grid_x = (M_pad // BM) * (twoN // bn)                                 # one CTA per tile
     grid  = (grid_x, 1, 1)
     block = (NW * 32, 1, 1)
-    fn(A_tmap, B_tmap,
-       np.intp(out_pad.data_ptr()), np.intp(fac_pad.data_ptr()),
+    fn(A_tmap, B_tmap, OUT_tmap, FAC_tmap,
        np.int32(M_pad), np.int32(N), np.int32(K),
        block=block, grid=grid, shared=smem)
 
