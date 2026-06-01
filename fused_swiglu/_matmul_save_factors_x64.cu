@@ -1,5 +1,15 @@
 // matmul_save_factors_x64: VARIANT of save_factors with WIDER TMEM loads.
 //
+// ── STATUS: tested, NO PERF GAIN at the colleague's shape. ─────────
+// At M=11136 K=3584 N=14336 (B200), measured via bench_stable.py with
+// rigorous warmup + 3s rep windows:
+//     baseline (x32) median = 1.917 ms
+//     this    (x64) median = 1.925 ms   (~8 µs slower, within noise)
+// The TMEM-read latency / wait_ld stall isn't a bottleneck here — the
+// extra register pressure from holding left[64]+gate[64] simultaneously
+// likely offsets any small wait_ld savings.  Kept as a sibling for
+// future reference / different shapes.
+//
 // Optimization vs `_matmul_save_factors.cu`:
 //   - Phase 1 uses `tcgen05.ld.32x32b.x64` (64 fp32/lane per call) instead
 //     of `x32` (32 fp32/lane).
@@ -8,9 +18,7 @@
 //   - Saves one `tcgen05.wait_ld` sync stall per warp per cluster-tile.
 //
 // Trade: 128 fp32 alive per lane temporarily (left[64] + gate[64]) →
-// more register pressure.  We rely on the compiler to free left/gate
-// regs as the inner pack loop progresses; if nvcc reports spills
-// (-Xptxas -v) we'll need to reshape.
+// more register pressure.
 //
 // All other architecture matches `_matmul_save_factors.cu` (persistent
 // grid + 8-warp Phase 1 + int4 stores in Phase 2).

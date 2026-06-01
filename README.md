@@ -79,15 +79,73 @@ pays off most.
 ```
 fused_swiglu_kernel/
   fused_swiglu/
-    __init__.py            # exports the wrappers and tile constants
-    triton_baseline.py     # copy of upstream save_factors kernel + helpers
-  bench.py                 # forward-kernel comparison at the target shape
-  README.md
+    triton_baseline.py             — colleague's Triton kernel (target)
+    _matmul_save_factors.cu        — CUDA production kernel (b42-based, int4 stores, persistent)
+    _matmul_save_factors_x64.cu    — variant: x64 TMEM loads (tested, NO gain)
+    _matmul_save_factors_tanh.cu   — variant: tanh-form sigmoid (tested, regression)
+    cuda_kernel.py                 — Python launcher for the production CUDA kernel
+    cuda_kernel_x64.py             — launcher for x64 variant
+    cuda_kernel_tanh.py            — launcher for tanh variant
+  bench.py                         — initial smoke bench
+  bench_stable.py                  — CANONICAL bench (long warmup + rep, rigorous)
+  bench_rigorous.py                — multi-round randomized bench (kept for reference)
+  bench_variants.py / bench_autotune.py / bench_cuda_sweep.py — older sweeps
+  artifacts/                       — Triton PTX dumps for inspection
 ```
 
 ## Run
 
 ```bash
 srun -p dedicated --gres=gpu:nvidia_b200:1 --time=00:10:00 \
-    ~/miniconda3/bin/python bench.py
+    ~/miniconda3/bin/python bench_stable.py
 ```
+
+## Final results (Path A complete)
+
+Measured via `bench_stable.py` (5s global warmup, 3s rep per variant):
+
+| variant | median | gap vs Triton |
+|---|---|---|
+| Triton baseline                | 1.804 ms | — |
+| **CUDA x32 PERS NS=7 GSM=16**  | **1.917 ms** | **+113 µs (+6.3%)** ← production |
+| CUDA x64 PERS NS=7 GSM=16      | 1.925 ms | +121 µs |
+| CUDA tanh PERS NS=7 GSM=16     | 1.976 ms | +172 µs (regression) |
+
+### What Path A actually bought us
+
+The journey through the optimization ladder, with honest attribution:
+
+| step | description | actual delta |
+|---|---|---|
+| First cut | b42 main loop + 4-warp save_factors epilogue | 2.003 ms (−204 µs vs cold start) |
+| 8-warp Phase 1 | 4 row × 2 col warp split | 1.961 ms (~within noise) |
+| Persistent grid | outer tile loop, mbar phases preserved across tiles | **1.917 ms (−44 µs, real win)** |
+| x64 TMEM loads | one load each for left/gate vs two | **no signal** (~8 µs slower median) |
+| tanh-form sigmoid | replace divide-form for sigmoid | **regression −60 µs** |
+
+**Only persistent grid was a real, statistically significant win** — the rest fell within
+run-to-run variance once measured rigorously (long warmup + 3s rep windows).
+
+### What's left
+
+The remaining 113 µs gap (6.3%) is the cost of our serial K-loop → epilogue → next K-loop
+chain.  Triton's persistent + FLATTEN compiler scheduling overlaps tile T's epilogue with
+tile T+1's K-loop; our hand-written CUDA does not.  Closing this requires a Path B
+restructure:
+
+- Double-buffered TMEM (so MMA can write tile T+1 while epilogue reads tile T)
+- Per-tile MMA-done mbarrier (not the CTA-wide one we have)
+- Split warp roles: warps 0 (TMA) and 1 (MMA) keep working across tiles independently;
+  epilogue warps 2..7 consume tiles asynchronously with their own per-tile signals.
+
+This is ~1-2 days of careful work and not yet attempted.
+
+### Benchmarking lessons learned
+
+- **GPU warmup matters a lot.** B200 takes ~1-2 seconds of mixed workload to fully
+  boost clocks.  `do_bench`'s default `warmup=25ms` is far too short.
+- **Run multiple variants and use long `rep`.**  `bench_stable.py`'s 5s global warmup +
+  3s per-variant rep gives medians stable to within ~10 µs.
+- **A single `do_bench` call right after compilation lies.**  Earlier ad-hoc
+  comparisons were confounded by 30-80 µs of warmup-state variance; once that was
+  controlled for, several "optimizations" evaporated.

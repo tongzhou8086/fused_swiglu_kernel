@@ -1,18 +1,25 @@
 // matmul_save_factors_tanh: VARIANT of save_factors using `tanh`-form sigmoid.
 //
+// ── STATUS: tested, REGRESSION at the colleague's shape. ──────────
+// At M=11136 K=3584 N=14336 (B200), measured via bench_stable.py:
+//     baseline (divide-form) median = 1.917 ms
+//     this     (tanh-form)   median = 1.976-1.997 ms   (50-80 µs slower)
+// Hypothesis: nvcc's `tanhf` does NOT lower to a single MUFU.TANH on
+// sm_100a — it probably calls a polynomial approximation (multiple
+// fma's + one MUFU op).  That's slower than the divide-form's
+// MUFU.EX2 + MUFU.RCP.  Could be revisited with a custom PTX wrapper
+// (`tanh.approx.f32`) but not pursued — SFU is only ~1.4% of runtime
+// at this shape anyway, so the ceiling for this optimization is small.
+//
 // Optimization vs `_matmul_save_factors.cu`:
 //   - Replaces `sigmoid(g) = 1 / (1 + exp(-g))` with the algebraically
 //     equivalent `sigmoid(g) = 0.5 + 0.5 * tanh(g/2)`.
-//   - The divide-form compiles to TWO SFU ops per element on Blackwell:
-//       MUFU.EX2 (for exp) + MUFU.RCP (for 1/x via __fdividef).
-//   - The tanh-form compiles to ONE SFU op per element: MUFU.TANH.
-//   - Halves the SFU pressure of the activation epilogue, which is
-//     fully on the critical path in this kernel (no K-loop/epilogue
-//     overlap yet).
+//   - INTENDED to use one MUFU.TANH instead of MUFU.EX2 + MUFU.RCP.
+//     In practice nvcc's tanhf doesn't appear to emit MUFU.TANH cleanly.
 //
 // Numerical note: tanhf has ~2 ulp fp32 precision; the divide-form
-// has ~2.5 ulp.  Both are well below bf16 rounding noise, so the
-// output should be very close (possibly bit-identical) to the baseline.
+// has ~2.5 ulp.  Both are well below bf16 rounding noise, so output
+// is correct (max_abs vs divide-form ≈ 1e-4 — within tolerance).
 //
 // All other architecture matches `_matmul_save_factors.cu` (persistent
 // grid + 8-warp Phase 1 + int4 stores in Phase 2).
