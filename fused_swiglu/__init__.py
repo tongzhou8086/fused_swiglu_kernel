@@ -42,3 +42,10 @@ try:
     HAS_CUDA_KERNEL_TANH = True
 except Exception as _e:
     HAS_CUDA_KERNEL_TANH = False
+
+# No-SMEM-staging variant (direct TMEM→regs→GMEM, uncoalesced writes).
+try:
+    from .cuda_kernel_nostg import matmul_save_factors_nostg as cuda_matmul_save_factors_nostg
+    HAS_CUDA_KERNEL_NOSTG = True
+except Exception as _e:
+    HAS_CUDA_KERNEL_NOSTG = False

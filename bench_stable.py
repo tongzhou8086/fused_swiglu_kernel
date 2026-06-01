@@ -41,6 +41,10 @@ VARIANTS = [
      lambda: fs.cuda_matmul_save_factors_tanh(x, W_packed, (256, 64, 7, 16), persistent=True)),
     ("CUDA tanh PERS NS=4 GSM=16",
      lambda: fs.cuda_matmul_save_factors_tanh(x, W_packed, (256, 64, 4, 16), persistent=True)),
+    ("CUDA nostg PERS NS=7 GSM=16",
+     lambda: fs.cuda_matmul_save_factors_nostg(x, W_packed, (256, 64, 7, 16), persistent=True)),
+    ("CUDA nostg PERS NS=4 GSM=16",
+     lambda: fs.cuda_matmul_save_factors_nostg(x, W_packed, (256, 64, 4, 16), persistent=True)),
 ]
 
 # Heavy global warmup: each variant runs in a tight loop for ~5 seconds total.
