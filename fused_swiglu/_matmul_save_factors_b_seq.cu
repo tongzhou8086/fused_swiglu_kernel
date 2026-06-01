@@ -746,22 +746,8 @@ __device__ __forceinline__ void matmul_save_factors_impl(
                 }
             }
 
-            // Epi-only barrier: ensure all 4 warps have finished writing
-            // SMEM staging before any reads it.
+            // Epi-only barrier (named bar.sync ID 1, NUM_EPI_THREADS).
             asm volatile("bar.sync 1, %0;" :: "n"(NUM_EPI_THREADS));
-
-            // ── EARLY epi_done arrive ──
-            // TMEM half is no longer accessed by this warp after Phase 1
-            // (Phase 2 only touches SMEM and GMEM).  Signal MMA NOW so it
-            // can start writing tile T+2 to this TMEM half while we still
-            // run Phase 2 in the background.  This is the overlap win.
-            if (lane == 0) {
-                const uint32_t mb_local =
-                    (uint32_t)__cvta_generic_to_shared(&epi_done_per_tile_mbar[half]);
-                const uint32_t mb_cta0 = mb_local & 0xFEFFFFFFu;
-                asm volatile("mbarrier.arrive.shared::cluster.b64 _, [%0];"
-                             :: "r"(mb_cta0) : "memory");
-            }
 
             // ── Phase 2: SMEM → GMEM coalesced (4 warps cooperate) ──
             {
@@ -801,9 +787,17 @@ __device__ __forceinline__ void matmul_save_factors_impl(
             }
 
             // Epi-only barrier: ensure all 4 warps finished GMEM stores
-            // (SMEM reads completed) before the NEXT tile's Phase 1
-            // overwrites the SMEM staging.
+            // before the NEXT tile's Phase 1 overwrites the SMEM staging.
             asm volatile("bar.sync 1, %0;" :: "n"(NUM_EPI_THREADS));
+
+            // Signal epi_done — one thread per epi warp arrives on CTA 0's mbar.
+            if (lane == 0) {
+                const uint32_t mb_local =
+                    (uint32_t)__cvta_generic_to_shared(&epi_done_per_tile_mbar[half]);
+                const uint32_t mb_cta0 = mb_local & 0xFEFFFFFFu;
+                asm volatile("mbarrier.arrive.shared::cluster.b64 _, [%0];"
+                             :: "r"(mb_cta0) : "memory");
+            }
             tile_idx++;
         }
     }
