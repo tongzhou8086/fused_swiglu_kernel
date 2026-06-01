@@ -121,32 +121,79 @@ for tile_id in range(my_sm, num_tiles, NUM_SMS=148):
     # TMA store #3 — the main `out` tile (REUSES same smem_stage)
     smem_stage  ← silu_gate.bf16
     TMA  store  out[pid_m, pid_n*128 + 0:128]      ← smem_stage
-    # NO wait — fall through to next tile
+    # ^ no wait_group.read after this store — store #3's SMEM drain
+    # and HBM commit happen asynchronously; Pool A loops straight back
+    # to `wait mbar.ACC_READY` for the NEXT tile.
+    # (Pool A still processes tiles serially — what "no wait" buys is
+    #  that the inflight store #3 keeps draining while Pool A is parked
+    #  on the next ACC_READY wait.)
 ```
 
-### What's racing what
+### What overlaps with what (the explicit answer)
 
-A wall-clock view of two consecutive tiles. Each cell is "what the warp
-is doing right now"; vertically aligned cells happen concurrently:
+To be precise about what the question "does the next tile start while
+the compute warps are still working?" actually asks, there are FOUR
+distinct overlap windows happening at once. Each pool sees a different
+"next tile":
+
+| What's running | What runs concurrently |
+|---|---|
+| Pool A epilogue for tile T (drain + SwiGLU + 3 stores) | TMA-load warp loads X/W for tile T+1 (all K-iters) |
+| Pool A epilogue for tile T (after the `TMEM_FREE` arrive, i.e. immediately after `tcgen05.ld`) | MMA warp issues `tcgen05.mma` for tile T+1 into the freshly released TMEM |
+| Pool A's TMA store #3 of tile T (still draining in HBM) | Pool A is already parked on `wait mbar.ACC_READY` for tile T+1; the inflight store doesn't block the next epilogue |
+| Pool A's epilogue for tile T+1 starts | Pool B is already issuing tile T+2's TMA loads (num_stages=4 buffer ring is that deep) |
+
+So **for Pool A specifically**, tiles are processed strictly serially —
+the 8 compute warps don't start tile T+1's drain while still mid-tile-T.
+But the inflight store #3 of tile T continues to drain in the background,
+and **all of Pool B is already running ahead** by the time Pool A wakes
+up on `ACC_READY` for the next tile. Net effect: the compute-warp pool
+is doing the most expensive thing it can possibly do every cycle
+(register-cvt → SMEM stage → TMA issue), with no idle gaps for
+load/MMA latency.
+
+### Wall-clock timeline (steady state, 3 tiles)
+
+The 3 rows are 3 physical warp groups; each column is a time slice;
+vertically aligned cells happen concurrently. Mbarrier events that
+synchronize across pools are drawn as vertical pipes `│ … │`.
 
 ```
-                 tile T -----------------------------►  tile T+1 ---------------►
-TMA-LOAD warp:   k=0 k=1 k=2 .. k=54 k=55            │ k=0 k=1 k=2 ..
-                  (already pipelined num_stages=4 ahead)
+                  ◄── tile T ──►   ◄── tile T+1 ──►  ◄── tile T+2 ──►
                                                      │
-MMA warp:        wait,mma  wait,mma  ..  wait,mma    │ wait,mma  wait,mma  ..
-                                          │          │  │
-                                          │ ACC_READY├──┤(starts as soon as
-                                          ▼          │  │ TMEM_FREE arrives)
-Compute warps:   . . . . . . . . tcgen05.ld → SwiGLU │ store#1 │wait│ store#2 │wait│ store#3
-                                          │   ▲      │
-                                          │   └ TMEM_FREE arrives here,
-                                          │     unblocks MMA warp's tile T+1
-                                          └ epilogue runs concurrently with
-                                            tile T+1's loads + MMAs
+ LOAD warp        K-loop T+1       K-loop T+2        │ K-loop T+3
+   (Pool B r1)    [56 cp.async]    [56 cp.async]     │ [56 cp.async]
+                  ───────────────  ────────────────  │ ───────────────
+                       FULL│           FULL│         │      FULL│
+                           ▼               ▼         │          ▼
+ MMA warp         K-loop T+1       K-loop T+2        │ K-loop T+3
+   (Pool B r0)    [56 wait+mma]    [56 wait+mma]     │ [56 wait+mma]
+                  ─────────────?   ────────────?     │
+                          ACC_READY│         ACC_READY│
+                                   ▼                  ▼
+ Compute warps    drain T │ swig │ st#1│w│ st#2│w│ st#3 │drain T+1│ swig │ st#1│ w │ st#2 │ w │ st#3
+   (Pool A)             │                                │
+                  TMEM_FREE│                       TMEM_FREE│
+                          └──── unblocks MMA T+1 ──┘
+                                                 │
+                  (store #3 of T is still draining
+                   in HBM here, async, off-critical-path)
 ```
 
-Three things to notice:
+Reading the picture: at any wall-clock instant in steady state,
+**THREE different tiles are in flight simultaneously** —
+Pool A is finalizing tile T in HBM, MMA warp is mid-K-loop on T+1, and
+the TMA-load warp is feeding T+2 into the SMEM ring buffer (depth = 4).
+
+The "no wait after store #3" comment in the pseudocode is what makes
+the picture seamless: if Pool A waited for store #3's SMEM-drain before
+looping, there'd be a small stall gap before the next tile's drain.
+With `FLATTEN=True` + persistent grid, the loop branch goes straight
+back to `wait ACC_READY`, and store #3's drain happens during whatever
+small gap is left between Pool B finishing T+1's MMA and Pool A picking
+up ACC_READY.
+
+### Three things to notice about the structure itself
 
 1. **The MMA warp and TMA-load warp run a NESTED `(tile × K)` loop** —
    they reuse `num_stages=4` SMEM buffers in a classic producer/consumer
@@ -160,10 +207,6 @@ Three things to notice:
    mbar.TMEM_FREE` happens right after `tcgen05.ld` finishes — well before
    store #1. So tile T+1's MMA can begin immediately; it does NOT wait for
    tile T's HBM stores.
-
-That's the entire trick. The epilogue's serial 3-store chain still costs
-its full latency on Pool A, but Pool B isn't watching — by the time
-store #3 commits, tile T+1's load+MMA pipeline is already 2-3 K-iters in.
 
 ---
 
