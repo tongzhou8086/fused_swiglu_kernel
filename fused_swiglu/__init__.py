@@ -49,3 +49,10 @@ try:
     HAS_CUDA_KERNEL_NOSTG = True
 except Exception as _e:
     HAS_CUDA_KERNEL_NOSTG = False
+
+# Path B: K-loop / epilogue overlap via double-buffered TMEM.
+try:
+    from .cuda_kernel_b import matmul_save_factors_b as cuda_matmul_save_factors_b
+    HAS_CUDA_KERNEL_B = True
+except Exception as _e:
+    HAS_CUDA_KERNEL_B = False
