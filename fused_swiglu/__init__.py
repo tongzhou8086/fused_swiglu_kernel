@@ -56,3 +56,17 @@ try:
     HAS_CUDA_KERNEL_B = True
 except Exception as _e:
     HAS_CUDA_KERNEL_B = False
+
+# Path B + nostg: overlap + direct TMEM→GMEM (no SMEM staging) → NS=7 fits.
+try:
+    from .cuda_kernel_b_nostg import matmul_save_factors_b_nostg as cuda_matmul_save_factors_b_nostg
+    HAS_CUDA_KERNEL_B_NOSTG = True
+except Exception as _e:
+    HAS_CUDA_KERNEL_B_NOSTG = False
+
+# Path B + TMA stores in the epilogue (matches Triton's epilogue pattern).
+try:
+    from .cuda_kernel_b_tmast import matmul_save_factors_b_tmast as cuda_matmul_save_factors_b_tmast
+    HAS_CUDA_KERNEL_B_TMAST = True
+except Exception as _e:
+    HAS_CUDA_KERNEL_B_TMAST = False

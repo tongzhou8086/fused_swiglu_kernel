@@ -47,10 +47,18 @@ VARIANTS = [
      lambda: fs.cuda_matmul_save_factors_nostg(x, W_packed, (256, 64, 4, 16), persistent=True)),
     ("CUDA B (overlap) NS=4 GSM=16",
      lambda: fs.cuda_matmul_save_factors_b(x, W_packed, (256, 64, 4, 16))),
-    ("CUDA B (overlap) NS=4 GSM=8",
-     lambda: fs.cuda_matmul_save_factors_b(x, W_packed, (256, 64, 4, 8))),
-    ("CUDA B (overlap) NS=4 GSM=32",
-     lambda: fs.cuda_matmul_save_factors_b(x, W_packed, (256, 64, 4, 32))),
+    ("CUDA B-nostg overlap NS=7 GSM=16",
+     lambda: fs.cuda_matmul_save_factors_b_nostg(x, W_packed, (256, 64, 7, 16))),
+    ("CUDA B-nostg overlap NS=7 GSM=8",
+     lambda: fs.cuda_matmul_save_factors_b_nostg(x, W_packed, (256, 64, 7, 8))),
+    ("CUDA B-nostg overlap NS=4 GSM=16",
+     lambda: fs.cuda_matmul_save_factors_b_nostg(x, W_packed, (256, 64, 4, 16))),
+    ("CUDA B+TMAst overlap NS=4 GSM=16",
+     lambda: fs.cuda_matmul_save_factors_b_tmast(x, W_packed, (256, 64, 4, 16))),
+    ("CUDA B+TMAst overlap NS=4 GSM=8",
+     lambda: fs.cuda_matmul_save_factors_b_tmast(x, W_packed, (256, 64, 4, 8))),
+    ("CUDA B+TMAst overlap NS=4 GSM=32",
+     lambda: fs.cuda_matmul_save_factors_b_tmast(x, W_packed, (256, 64, 4, 32))),
 ]
 
 # Heavy global warmup: each variant runs in a tight loop for ~5 seconds total.
