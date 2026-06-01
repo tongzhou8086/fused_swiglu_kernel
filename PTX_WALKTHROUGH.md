@@ -60,6 +60,113 @@ tile T+1 runs concurrently with the entire store chain.
 
 ---
 
+## Loop structure (the part that's easy to lose in the PTX)
+
+Each of the three roles runs its OWN loop nest. The three nests are NOT
+in the same basic block — they're separate loops in separate warps, glued
+together only by SMEM mbarriers. This is what the structure looks like
+if you write it back out in pseudocode:
+
+```
+=====================================================================
+ Persistent grid driver (all warps see this — common outer)
+=====================================================================
+for tile_id in range(my_sm, num_tiles, NUM_SMS=148):
+    (pid_m, pid_n) = swizzle(tile_id, GROUP_M=32)
+
+    ─────────────────────────────────────────────────────────────────
+     Pool B / role 1 — TMA-LOAD warp   (BB0_2 outer × BB0_13 inner)
+    ─────────────────────────────────────────────────────────────────
+    for k in range(K / BLOCK_K = 56):
+        wait  mbar[k % 4].EMPTY        ← MMA warp signals when done
+        arrive mbar[k % 4].FULL  expect_tx = 49152 bytes
+        TMA  load  X [pid_m, k]    → smem_X [k%4]    ┐
+        TMA  load  W_lo[k, pid_n]  → smem_Wl[k%4]    │ 3 issued in parallel
+        TMA  load  W_hi[k, pid_n]  → smem_Wh[k%4]    ┘
+
+    ─────────────────────────────────────────────────────────────────
+     Pool B / role 0 — MMA warp        (BB0_2 outer × BB0_7 inner)
+    ─────────────────────────────────────────────────────────────────
+    for k in range(56):
+        wait  mbar[k % 4].FULL         ← load warp signals when ready
+        tcgen05.mma  TMEM_acc += smem_X[k%4] @ smem_Wl[k%4]   ┐
+        tcgen05.mma  TMEM_acc += smem_X[k%4] @ smem_Wh[k%4]   │ 4× per k-iter
+        tcgen05.mma  ...                                      │ (splits the
+        tcgen05.mma  ...                                      ┘  BLOCK_K=64
+                                                                 along the
+                                                                 K axis of
+                                                                 the MMA shape)
+        arrive mbar[(k-pipeline) % 4].EMPTY     ← release older buffer
+    tcgen05.commit  mbar.ACC_READY   ← end-of-tile: accumulator complete
+
+    ─────────────────────────────────────────────────────────────────
+     Pool A — 8 compute warps          (BB0_20 — NO inner K-loop)
+    ─────────────────────────────────────────────────────────────────
+    wait    mbar.ACC_READY              ← MMA warp signals end-of-tile
+    tcgen05.ld   TMEM_acc → regs        ← drain accumulator
+    arrive  mbar.TMEM_FREE              ← MMA warp may overwrite TMEM now
+                                          (next tile can start IMMEDIATELY)
+    silu_gate = silu(regs[:128]) * regs[128:]
+
+    # TMA store #1 — factors lo half (backward fast-path inputs)
+    smem_stage  ← regs.bf16
+    TMA  store  factors[pid_m, pid_n*256 + 0:128]   ← smem_stage
+    wait_group.read 0                  ← SMEM drain only, NOT HBM commit
+
+    # TMA store #2 — factors hi half (REUSES same smem_stage buffer)
+    smem_stage  ← (regs * sigmoid).bf16
+    TMA  store  factors[pid_m, pid_n*256 + 128:256] ← smem_stage
+    wait_group.read 0
+
+    # TMA store #3 — the main `out` tile (REUSES same smem_stage)
+    smem_stage  ← silu_gate.bf16
+    TMA  store  out[pid_m, pid_n*128 + 0:128]      ← smem_stage
+    # NO wait — fall through to next tile
+```
+
+### What's racing what
+
+A wall-clock view of two consecutive tiles. Each cell is "what the warp
+is doing right now"; vertically aligned cells happen concurrently:
+
+```
+                 tile T -----------------------------►  tile T+1 ---------------►
+TMA-LOAD warp:   k=0 k=1 k=2 .. k=54 k=55            │ k=0 k=1 k=2 ..
+                  (already pipelined num_stages=4 ahead)
+                                                     │
+MMA warp:        wait,mma  wait,mma  ..  wait,mma    │ wait,mma  wait,mma  ..
+                                          │          │  │
+                                          │ ACC_READY├──┤(starts as soon as
+                                          ▼          │  │ TMEM_FREE arrives)
+Compute warps:   . . . . . . . . tcgen05.ld → SwiGLU │ store#1 │wait│ store#2 │wait│ store#3
+                                          │   ▲      │
+                                          │   └ TMEM_FREE arrives here,
+                                          │     unblocks MMA warp's tile T+1
+                                          └ epilogue runs concurrently with
+                                            tile T+1's loads + MMAs
+```
+
+Three things to notice:
+
+1. **The MMA warp and TMA-load warp run a NESTED `(tile × K)` loop** —
+   they reuse `num_stages=4` SMEM buffers in a classic producer/consumer
+   ring. Both are `Depth=2` in the PTX loop annotations.
+
+2. **Pool A has NO inner K-loop.** Its tile-loop body is just one
+   accumulator drain + SwiGLU + 3 TMA stores. All K-axis work is offloaded
+   to Pool B.
+
+3. **TMEM is released BEFORE the stores even start.** The `arrive
+   mbar.TMEM_FREE` happens right after `tcgen05.ld` finishes — well before
+   store #1. So tile T+1's MMA can begin immediately; it does NOT wait for
+   tile T's HBM stores.
+
+That's the entire trick. The epilogue's serial 3-store chain still costs
+its full latency on Pool A, but Pool B isn't watching — by the time
+store #3 commits, tile T+1's load+MMA pipeline is already 2-3 K-iters in.
+
+---
+
 ## 1. Entry: split the CTA into two warp pools
 
 ```ptx
