@@ -69,32 +69,31 @@ How a single PTX entry point becomes 3 concurrent worker roles via the
 
 ```mermaid
 flowchart TB
-    entry["CTA launch<br/>num_warps = 12 (8 + 4 extra)"]
-    entry --> split{"%tid.x &gt;&gt; 5<br/>warp_id &lt; 8?"}
+    entry["CTA launch: num_warps = 12 (8 + 4 extra)"]
+    entry --> split{"warp_id = tid.x shr 5<br/>is warp_id less than 8?"}
 
-    split -->|yes| poolA["<b>Pool A — DEFAULT</b><br/>warps 0..7<br/>regs = 240<br/>path: BB0_18 → BB0_20"]
-    split -->|no|  poolB["<b>Pool B — SPECIALIZED</b><br/>warps 8..11<br/>regs = 24<br/>path: BB0_1 → BB0_2"]
+    split -->|yes| poolA["Pool A: DEFAULT<br/>warps 0 to 7<br/>regs = 240<br/>path: BB0_18 to BB0_20"]
+    split -->|no|  poolB["Pool B: SPECIALIZED<br/>warps 8 to 11<br/>regs = 24<br/>path: BB0_1 to BB0_2"]
 
-    poolB --> dispatch{"ld.shared.b8 [smem + warp_id]<br/>brx.idx"}
-    dispatch -->|"role 0"| mma["<b>★ MMA warp</b> (warp 8)<br/>BB0_7<br/>4× tcgen05.mma per K-iter"]
-    dispatch -->|"role 1"| load["<b>★ TMA-LOAD warp</b> (warps 9-10)<br/>BB0_13<br/>3× cp.async.bulk per K-iter<br/>(X, W_lo, W_hi)"]
-    dispatch -->|"role 2"| idle["idle pad (warp 11)<br/>BB0_17"]
-    dispatch -->|"role 3"| exit["exit<br/>BB0_28"]
+    poolB --> dispatch{"per-warp role tag<br/>ld.shared.b8 then brx.idx"}
+    dispatch -->|role 0| mma["MMA warp (warp 8)<br/>BB0_7<br/>4x tcgen05.mma per K-iter"]
+    dispatch -->|role 1| load["TMA-LOAD warp (warps 9-10)<br/>BB0_13<br/>3x cp.async.bulk per K-iter<br/>X, W_lo, W_hi"]
+    dispatch -->|role 2| idle["idle pad (warp 11)<br/>BB0_17"]
+    dispatch -->|role 3| exit_["exit<br/>BB0_28"]
 
-    poolA --- jobA["<b>Job:</b> tcgen05.ld TMEM → regs<br/>SwiGLU math<br/>3× cp.async.bulk.tensor (TMA STORES)<br/>private sync: bar.sync 0, 256"]
+    poolA --- jobA["Job: tcgen05.ld TMEM to regs<br/>SwiGLU math<br/>3x cp.async.bulk.tensor (TMA STORES)<br/>private sync: bar.sync 0, 256"]
 
-    %% mbarrier wires
-    load  -. "FULL mbar (load done)"  .-> mma
+    load  -. "FULL mbar (load done)" .-> mma
     mma   -. "EMPTY mbar (buf reuse)" .-> load
-    mma   -. "ACC_READY mbar"         .-> poolA
-    poolA -. "TMEM_FREE mbar"         .-> mma
+    mma   -. "ACC_READY mbar" .-> poolA
+    poolA -. "TMEM_FREE mbar" .-> mma
 
     classDef pool fill:#e8f4ff,stroke:#3b6db5,stroke-width:2px,color:#000
     classDef role fill:#fff4e6,stroke:#d18b1f,stroke-width:2px,color:#000
     classDef misc fill:#f0f0f0,stroke:#888,color:#000
     class poolA,poolB pool
     class mma,load role
-    class idle,exit,jobA misc
+    class idle,exit_,jobA misc
 ```
 
 The dotted arrows are the four SMEM mbarriers that synchronize the
@@ -109,35 +108,35 @@ overlap is unmissable.
 
 ```mermaid
 gantt
-    title Steady-state pipeline — 3 tiles concurrently in flight
+    title Steady-state pipeline - 3 tiles concurrently in flight
     dateFormat  X
     axisFormat  %L
 
-    section TMA-load warp (Pool B r1)
+    section TMA-load warp (Pool B role 1)
     K-loop tile T+1 (load X, W_lo, W_hi)  :done,   l1, 0,  60
     K-loop tile T+2                       :active, l2, 55, 115
     K-loop tile T+3                       :        l3, 110, 170
 
-    section MMA warp (Pool B r0)
-    K-loop tile T+1 (56× tcgen05.mma)     :done,   m1, 5,  65
+    section MMA warp (Pool B role 0)
+    K-loop tile T+1 (56x tcgen05.mma)     :done,   m1, 5,  65
     K-loop tile T+2                       :active, m2, 60, 120
     K-loop tile T+3                       :        m3, 115, 175
 
-    section Compute warps (Pool A — epilogue + TMA stores)
-    drain T (tcgen05.ld)                  :crit, dT, 10, 18
-    SwiGLU T                              :      sT, 18, 22
-    TMA store#1 factors_lo T              :crit, s1T, 22, 32
-    wait SMEM drain                       :      w1T, 32, 36
-    TMA store#2 factors_hi T              :crit, s2T, 36, 46
-    wait SMEM drain                       :      w2T, 46, 50
-    TMA store#3 out T                     :crit, s3T, 50, 60
-    drain T+1                             :crit, dT1, 65, 73
-    SwiGLU T+1                            :      sT1, 73, 77
-    TMA store#1 T+1                       :crit, s1T1, 77, 87
-    wait                                  :      w1T1, 87, 91
-    TMA store#2 T+1                       :crit, s2T1, 91, 101
-    wait                                  :      w2T1, 101, 105
-    TMA store#3 T+1                       :crit, s3T1, 105, 115
+    section Compute warps (Pool A epilogue)
+    drain T (tcgen05.ld)        :crit, dT, 10, 18
+    SwiGLU T                    :      sT, 18, 22
+    store 1 factors_lo T        :crit, s1T, 22, 32
+    wait SMEM drain             :      w1T, 32, 36
+    store 2 factors_hi T        :crit, s2T, 36, 46
+    wait SMEM drain             :      w2T, 46, 50
+    store 3 out T               :crit, s3T, 50, 60
+    drain T+1                   :crit, dT1, 65, 73
+    SwiGLU T+1                  :      sT1, 73, 77
+    store 1 T+1                 :crit, s1T1, 77, 87
+    wait                        :      w1T1, 87, 91
+    store 2 T+1                 :crit, s2T1, 91, 101
+    wait                        :      w2T1, 101, 105
+    store 3 T+1                 :crit, s3T1, 105, 115
 ```
 
 What the chart shows:
