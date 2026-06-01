@@ -79,18 +79,18 @@ pays off most.
 ```
 fused_swiglu_kernel/
   fused_swiglu/
-    triton_baseline.py             — colleague's Triton kernel (target)
-    _matmul_save_factors.cu        — CUDA production kernel (b42-based, int4 stores, persistent)
-    _matmul_save_factors_x64.cu    — variant: x64 TMEM loads (tested, NO gain)
-    _matmul_save_factors_tanh.cu   — variant: tanh-form sigmoid (tested, regression)
-    cuda_kernel.py                 — Python launcher for the production CUDA kernel
-    cuda_kernel_x64.py             — launcher for x64 variant
-    cuda_kernel_tanh.py            — launcher for tanh variant
-  bench.py                         — initial smoke bench
-  bench_stable.py                  — CANONICAL bench (long warmup + rep, rigorous)
-  bench_rigorous.py                — multi-round randomized bench (kept for reference)
-  bench_variants.py / bench_autotune.py / bench_cuda_sweep.py — older sweeps
-  artifacts/                       — Triton PTX dumps for inspection
+    triton_baseline.py                 — colleague's Triton kernel (target)
+    _matmul_save_factors.cu            — Path A: b42-based, int4 stores, persistent
+    _matmul_save_factors_x64.cu        — variant: x64 TMEM loads (tested, no gain)
+    _matmul_save_factors_tanh.cu       — variant: tanh-form sigmoid (regression)
+    _matmul_save_factors_nostg.cu      — variant: no SMEM staging (regression)
+    _matmul_save_factors_b.cu          — Path B: K-loop / epilogue OVERLAP
+    _matmul_save_factors_b_nostg.cu    — Path B + no SMEM staging (regression)
+    _matmul_save_factors_b_tmast.cu    — Path B + TMA stores ← CURRENT BEST
+    cuda_kernel*.py                    — Python launchers (one per .cu)
+  bench_stable.py                      — CANONICAL bench (long warmup + 3s rep)
+  dump_triton_ptx.py                   — dumps + analyses Triton's PTX for comparison
+  artifacts/                           — Triton PTX / TTGIR dumps
 ```
 
 ## Run
@@ -100,52 +100,64 @@ srun -p dedicated --gres=gpu:nvidia_b200:1 --time=00:10:00 \
     ~/miniconda3/bin/python bench_stable.py
 ```
 
-## Final results (Path A complete)
+## Final results
 
-Measured via `bench_stable.py` (5s global warmup, 3s rep per variant):
+Measured via `bench_stable.py` (5s global warmup, 3s rep per variant) on B200:
 
-| variant | median | gap vs Triton |
-|---|---|---|
-| Triton baseline                | 1.804 ms | — |
-| **CUDA x32 PERS NS=7 GSM=16**  | **1.917 ms** | **+113 µs (+6.3%)** ← production |
-| CUDA x64 PERS NS=7 GSM=16      | 1.925 ms | +121 µs |
-| CUDA tanh PERS NS=7 GSM=16     | 1.976 ms | +172 µs (regression) |
+| variant | median | TFLOPS | % peak | gap vs Triton |
+|---|---|---|---|---|
+| Triton baseline                       | 1.788 ms | 1280 | 56.9 % | — |
+| **CUDA Path B + TMA stores NS=4 GSM=16** | **1.849 ms** | **1237** | **55.0 %** | **+61 µs (+3.4 %)** ← current best |
+| CUDA Path B (int4 stores) NS=4 GSM=16 | 1.858 ms | 1232 | 54.8 % | +70 µs |
+| CUDA Path A (x32) NS=7 GSM=16         | 1.909 ms | 1199 | 53.3 % | +121 µs |
 
-### What Path A actually bought us
+We close ~55 % of the original CUDA-vs-Triton gap and end at **96.6 % of Triton's perf**, bit-identical (max_abs = 0.0).
 
-The journey through the optimization ladder, with honest attribution:
+### The journey — what actually mattered
 
-| step | description | actual delta |
-|---|---|---|
-| First cut | b42 main loop + 4-warp save_factors epilogue | 2.003 ms (−204 µs vs cold start) |
-| 8-warp Phase 1 | 4 row × 2 col warp split | 1.961 ms (~within noise) |
-| Persistent grid | outer tile loop, mbar phases preserved across tiles | **1.917 ms (−44 µs, real win)** |
-| x64 TMEM loads | one load each for left/gate vs two | **no signal** (~8 µs slower median) |
-| tanh-form sigmoid | replace divide-form for sigmoid | **regression −60 µs** |
+| step | description | actual delta | verdict |
+|---|---|---|---|
+| Path A first cut       | b42 main loop + 4-warp save_factors epilogue       | 2.003 ms | — |
+| 8-warp Phase 1         | 4 row × 2 col warp split for the epilogue          | 1.961 ms | within noise |
+| Persistent grid        | outer tile loop, mbar phases preserved             | 1.917 ms | **−44 µs, real win** |
+| x64 TMEM loads         | wider tcgen05.ld vs two narrow loads               | ~no change | no signal |
+| tanh-form sigmoid      | one SFU op instead of two                          | +60 µs    | regression |
+| Drop SMEM staging      | direct TMEM→regs→GMEM (uncoalesced stores)         | +400 µs   | regression |
+| **Path B: K-loop / epilogue overlap** | double-buffered TMEM, per-tile mbars   | **−45 µs, real win** | the big win |
+| Early `epi_done` arrive | move arrive between Phase 1 and Phase 2           | **−28 µs gap, real win** | sync audit |
+| Path B + no SMEM staging | NS=7 ring, direct GMEM stores                    | +170 µs   | uncoalesced stores cost more than ring-depth gains |
+| **Path B + TMA stores** (this commit) | async cp.async.bulk.tensor.2d stores      | **−9 µs, real win** | matches Triton's epilogue |
+| Path B + TMA stores + SWIZZLE_128B | swizzled SMEM writes for TMA stores      | **dead end** | cuTensorMap rejects box_width > 64 bf16 |
 
-**Only persistent grid was a real, statistically significant win** — the rest fell within
-run-to-run variance once measured rigorously (long warmup + 3s rep windows).
+The two real architectural wins — **persistent grid** and **K-loop/epilogue overlap** — together account for ~80 µs of the 140 µs original gap.  The TMA store swap inside the overlap framework picks up another ~10 µs.  Several plausible-looking changes (x64 loads, tanh, dropping SMEM staging) turned out to be noise or regressions once measured rigorously.
 
-### What's left
+### Why we stopped — the remaining 61 µs
 
-The remaining 113 µs gap (6.3%) is the cost of our serial K-loop → epilogue → next K-loop
-chain.  Triton's persistent + FLATTEN compiler scheduling overlaps tile T's epilogue with
-tile T+1's K-loop; our hand-written CUDA does not.  Closing this requires a Path B
-restructure:
+After PTX-dumping Triton (see `dump_triton_ptx.py` + `artifacts/save_factors.ptx`):
 
-- Double-buffered TMEM (so MMA can write tile T+1 while epilogue reads tile T)
-- Per-tile MMA-done mbarrier (not the CTA-wide one we have)
-- Split warp roles: warps 0 (TMA) and 1 (MMA) keep working across tiles independently;
-  epilogue warps 2..7 consume tiles asynchronously with their own per-tile signals.
+| feature | Triton | Path B + TMAst | match? |
+|---|---|---|---|
+| K-pipeline NS                        | 4 | 4 | ✓ |
+| Persistent grid + GROUP_SIZE_M       | yes | yes | ✓ |
+| Warp-specialized                     | yes | yes | ✓ |
+| SMEM staging in epilogue             | yes (32 `st.shared`) | yes | ✓ |
+| TMA stores per tile                  | 3 (`cp.async.bulk.tensor.2d`) | 2 (combined FAC) | ≈ |
+| SWIZZLE for TMA stores               | `SWIZZLE_NONE` (forced by box width) | `SWIZZLE_NONE` | ✓ |
+| **MMA grouping**                     | **`cta_group::1` (single-CTA)** | **`cta_group::2` (cluster)** | **✗** |
 
-This is ~1-2 days of careful work and not yet attempted.
+The only structural difference left is **single-CTA MMA vs cluster MMA**.  At this shape the cluster's A-multicast benefit apparently doesn't pay for the cluster sync / multicast-arrive overhead.  Switching to single-CTA would be a 200+ line restructure with uncertain payoff — we explicitly decided this is a dead end for this optimization round and stopped at 96.6 % of Triton.
+
+### Dead ends explored (so we don't re-explore them)
+
+1. **`SWIZZLE_128B` TMA stores** — cuTensorMap requires inner-box-dim ≤ 128 bytes (= 64 bf16).  Our 128-bf16-wide stores would need to split into 6 stores per tile (vs 2 today).  Triton itself uses `SWIZZLE_NONE` for the same reason — verified by box-width probing.
+2. **No SMEM staging in epilogue** — frees ~100 KB SMEM (NS=4 → NS=7 ring fits) but the TMEM `32x32b_x32` layout puts one row per lane, so direct GMEM stores hit 32 different cachelines per warp.  Lost more than gained (+170 µs net).
+3. **`cta_group::1` (single-CTA) MMA** — believed to be where Triton's remaining edge lives, but not pursued; significant rewrite, uncertain payoff at our shape.
+4. **TMA stores on non-overlap kernel** (commit `9df0e84`, reverted in `40bd120`) — was 172 µs WORSE than int4 stores because `wait_group<0>` stalled the whole CTA between tiles with no other work to hide behind.  Only became a win once layered onto Path B's overlap.
 
 ### Benchmarking lessons learned
 
-- **GPU warmup matters a lot.** B200 takes ~1-2 seconds of mixed workload to fully
-  boost clocks.  `do_bench`'s default `warmup=25ms` is far too short.
-- **Run multiple variants and use long `rep`.**  `bench_stable.py`'s 5s global warmup +
-  3s per-variant rep gives medians stable to within ~10 µs.
-- **A single `do_bench` call right after compilation lies.**  Earlier ad-hoc
-  comparisons were confounded by 30-80 µs of warmup-state variance; once that was
-  controlled for, several "optimizations" evaporated.
+- **GPU warmup matters a lot.**  B200 takes ~1-2 seconds of mixed workload to fully boost clocks.  `do_bench`'s default `warmup=25ms` is far too short.
+- **Run multiple variants and use long `rep`.**  `bench_stable.py`'s 5s global warmup + 3s per-variant rep gives medians stable to within ~10 µs.
+- **A single `do_bench` call right after compilation lies.**  Earlier ad-hoc comparisons were confounded by 30-80 µs of warmup-state variance; once that was controlled for, several "optimizations" evaporated.
+- **Compare GAPS within the same run**, not absolute medians across runs.  GPU thermal/clock state drifts; the gap to Triton in the same run is the right signal.
+- **PTX-dump the baseline before speculating.**  We avoided two more dead ends (NS=7, SWIZZLE_128B speculation) once we saw Triton's actual settings.
