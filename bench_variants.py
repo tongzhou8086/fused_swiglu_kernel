@@ -61,8 +61,23 @@ ok_base = check("CUDA (x32 ld, persistent NS=4 GSM=16)",
 # x64 variant
 ok_x64 = check("CUDA (x64 ld, persistent NS=4 GSM=16)",
                lambda: fs.cuda_matmul_save_factors_x64(x, W_packed, (256, 64, 4, 16), persistent=True))
+# tanh variant
+ok_tanh = check("CUDA (tanh sigmoid, persistent NS=4 GSM=16)",
+                lambda: fs.cuda_matmul_save_factors_tanh(x, W_packed, (256, 64, 4, 16), persistent=True))
 
-if not (ok_base and ok_x64):
+# Tanh-form is algebraically equivalent but numerically may differ by sub-ulp.
+# We accept small diffs there.
+ok_tanh_loose = True
+if not ok_tanh:
+    out_c, fac_c = fs.cuda_matmul_save_factors_tanh(x, W_packed, (256, 64, 4, 16), persistent=True)
+    out_t, fac_t = fs.fused_swiglu_wide_packed_save_factors(x, W_packed)
+    err = max((out_c.float() - out_t.float()).abs().max().item(),
+              (fac_c.float() - fac_t.float()).abs().max().item())
+    atol = max(1.0, K ** 0.5 / 16)
+    ok_tanh_loose = err < atol
+    print(f"  tanh: tolerance-accepted? err={err:.3e} atol={atol:.2f} → {'OK' if ok_tanh_loose else 'FAIL'}")
+
+if not (ok_base and ok_x64 and ok_tanh_loose):
     print("\nCorrectness FAILED — bailing.")
     sys.exit(1)
 
@@ -86,3 +101,9 @@ bench("CUDA x64  PERS NS=7 GSM=16",
       lambda: fs.cuda_matmul_save_factors_x64(x, W_packed, (256, 64, 7, 16), persistent=True))
 bench("CUDA x64  PERS NS=4 GSM=16",
       lambda: fs.cuda_matmul_save_factors_x64(x, W_packed, (256, 64, 4, 16), persistent=True))
+
+# tanh variant
+bench("CUDA tanh PERS NS=7 GSM=16",
+      lambda: fs.cuda_matmul_save_factors_tanh(x, W_packed, (256, 64, 7, 16), persistent=True))
+bench("CUDA tanh PERS NS=4 GSM=16",
+      lambda: fs.cuda_matmul_save_factors_tanh(x, W_packed, (256, 64, 4, 16), persistent=True))

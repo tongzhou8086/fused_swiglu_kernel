@@ -35,3 +35,10 @@ try:
     HAS_CUDA_KERNEL_X64 = True
 except Exception as _e:
     HAS_CUDA_KERNEL_X64 = False
+
+# tanh-form sigmoid variant (1 SFU op per element instead of 2).
+try:
+    from .cuda_kernel_tanh import matmul_save_factors_tanh as cuda_matmul_save_factors_tanh
+    HAS_CUDA_KERNEL_TANH = True
+except Exception as _e:
+    HAS_CUDA_KERNEL_TANH = False
