@@ -67,26 +67,29 @@ tile T+1 runs concurrently with the entire store chain.
 How a single PTX entry point becomes 3 concurrent worker roles via the
 `warp_id` split + role tag dispatch:
 
+> If the diagram below doesn't render on GitHub, see
+> [`artifacts/warp_pool_architecture.png`](artifacts/warp_pool_architecture.png).
+
 ```mermaid
 flowchart TB
-    entry["CTA launch: num_warps = 12 (8 + 4 extra)"]
-    entry --> split{"warp_id = tid.x shr 5<br/>is warp_id less than 8?"}
+    entry["CTA launch with 12 warps total"]
+    entry --> split{"warp_id less than 8 ?"}
 
-    split -->|yes| poolA["Pool A: DEFAULT<br/>warps 0 to 7<br/>regs = 240<br/>path: BB0_18 to BB0_20"]
-    split -->|no|  poolB["Pool B: SPECIALIZED<br/>warps 8 to 11<br/>regs = 24<br/>path: BB0_1 to BB0_2"]
+    split -->|yes| poolA["Pool A DEFAULT<br>warps 0 to 7<br>regs 240<br>path BB0_18 to BB0_20"]
+    split -->|no| poolB["Pool B SPECIALIZED<br>warps 8 to 11<br>regs 24<br>path BB0_1 to BB0_2"]
 
-    poolB --> dispatch{"per-warp role tag<br/>ld.shared.b8 then brx.idx"}
-    dispatch -->|role 0| mma["MMA warp (warp 8)<br/>BB0_7<br/>4x tcgen05.mma per K-iter"]
-    dispatch -->|role 1| load["TMA-LOAD warp (warps 9-10)<br/>BB0_13<br/>3x cp.async.bulk per K-iter<br/>X, W_lo, W_hi"]
-    dispatch -->|role 2| idle["idle pad (warp 11)<br/>BB0_17"]
-    dispatch -->|role 3| exit_["exit<br/>BB0_28"]
+    poolB --> dispatch{"per-warp role tag<br>brx.idx"}
+    dispatch -->|0| mma["MMA warp<br>warp 8<br>BB0_7<br>4 tcgen05.mma per K-iter"]
+    dispatch -->|1| load["TMA-LOAD warp<br>warps 9 and 10<br>BB0_13<br>3 cp.async.bulk per K-iter<br>X, W_lo, W_hi"]
+    dispatch -->|2| idle["idle pad<br>warp 11<br>BB0_17"]
+    dispatch -->|3| exit_["exit<br>BB0_28"]
 
-    poolA --- jobA["Job: tcgen05.ld TMEM to regs<br/>SwiGLU math<br/>3x cp.async.bulk.tensor (TMA STORES)<br/>private sync: bar.sync 0, 256"]
+    poolA --- jobA["Job<br>tcgen05.ld TMEM to regs<br>SwiGLU math<br>3 cp.async.bulk.tensor TMA stores<br>private sync bar.sync 0 256"]
 
-    load  -. "FULL mbar (load done)" .-> mma
-    mma   -. "EMPTY mbar (buf reuse)" .-> load
-    mma   -. "ACC_READY mbar" .-> poolA
-    poolA -. "TMEM_FREE mbar" .-> mma
+    load -.->|FULL mbar load done| mma
+    mma -.->|EMPTY mbar buf reuse| load
+    mma -.->|ACC_READY mbar| poolA
+    poolA -.->|TMEM_FREE mbar| mma
 
     classDef pool fill:#e8f4ff,stroke:#3b6db5,stroke-width:2px,color:#000
     classDef role fill:#fff4e6,stroke:#d18b1f,stroke-width:2px,color:#000
@@ -105,6 +108,9 @@ no shared registers, no shared CTA-wide barriers.
 Steady-state wall-clock view. Each row is a warp group; horizontal
 extent is wall-clock time. Mermaid renders this as a Gantt chart so
 overlap is unmissable.
+
+> If the gantt below doesn't render on GitHub, see
+> [`artifacts/pipeline_timeline.png`](artifacts/pipeline_timeline.png).
 
 ```mermaid
 gantt
